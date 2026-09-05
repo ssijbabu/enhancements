@@ -333,25 +333,6 @@ config has to resolve correctly regardless of which binary reads it later - miti
 relevant binary exposing `get-azure-token` at the same fixed path rather than assuming it can always
 resolve its own executable path at write time.
 
-## Design Details
-
-### TODO
-
-1. Confirm the default token audience is correct for every AKS Azure AD integration mode (the modern,
-   fully hub-managed mode and any legacy configuration), not just the one validated so far.
-2. Confirm whether the three-credential fallback order should be user-configurable, or whether a fixed
-   order is sufficient for all real deployments.
-3. Confirm the minimal RBAC needed for the bootstrap step is not broader than necessary for an
-   Azure-only hub, given the shared bootstrap `ClusterRole` also grants CSR-related permissions this
-   driver never uses.
-
-### Open Questions
-
-- Should addon registration eventually be able to use this same Azure AD identity directly, as a
-  follow-up, or is delegating to the existing `token`/`csr` addon drivers the permanent answer?
-- Is there a project convention this should follow for third-party cloud-identity token audiences, or
-  is a well-known default with an override flag sufficient?
-
 ### Test Plan
 
 - Unit tests for the credential-chain fallback logic and the hub-side RBAC binding/approval logic, in
@@ -419,10 +400,6 @@ above exists specifically to address this.
   independently of it), and would imply migrating the already-shipped AWS IAM and gRPC drivers out of
   the core repository as well, not just deciding where this new one lands. Worth considering
   separately, as its own enhancement, rather than deciding it implicitly as a side effect of this one.
-
-## Infrastructure Needed [optional]
-
-No specific infrastructure required.
 
 ## References
 
