@@ -28,8 +28,12 @@ usable for OCM registration today.
 ### Goals
 
 - Let a managed cluster register to a hub using an Azure AD identity.
-- Support all three Azure credential mechanisms above through the same driver, trying each in an
-  ordered fallback.
+- Support all three Azure credential mechanisms above through the same driver, with the operator
+  selecting explicitly which one applies (`azure.credential`) rather than an automatic runtime
+  fallback - required so the Helm chart can expose four distinct, validated configuration shapes
+  (Managed Identity, Workload Identity Federation, service-principal secret, service-principal
+  certificate) instead of one chart input path that behaves differently depending on which
+  environment variables happen to be present at runtime.
 - Make the authentication strategy pluggable at the config level, consistent with how OCM already
   supports multiple registration strategies (`csr`, gRPC, and one other cloud-IAM-based strategy
   today).
@@ -71,11 +75,21 @@ authentication strategy remains `csr`:
      --context ${CTX_HUB_CLUSTER}
 ```
 
+This enables the driver hub-wide; it does not name any specific managed cluster's identity. The
+only azure-specific hub configuration is optional and applies to every joining cluster equally: a
+list of regex patterns matched against a joining cluster's Azure AD object ID for auto-approval
+(`--auto-approved-azure-identity-patterns`, mirroring the existing `awsirsa` driver's
+`autoApprovedARNPatterns`). A specific managed cluster's identity (its object ID and client ID) is
+configured only on that cluster's own `Klusterlet`, in Story 2 below - never on the hub.
+
 #### Story 2 - Managed cluster administrator joins a cluster using an Azure AD identity
 
 I run my hub and managed clusters on AKS. Depending on which of the three Azure credential mechanisms
 fits my environment, I select it explicitly with `--azure-credential` - all use the same `clusteradm
-join` shape, differing only in the credential flag and what's supplied for the identity:
+join` shape, differing only in the credential flag and what's supplied for the identity. This explicit
+selection (rather than an automatic runtime fallback) is what lets the Helm chart expose four
+distinct, independently-validated input shapes instead of one chart path whose effective behavior
+depends on which environment variables happen to be set at deploy time:
 
 **Managed Identity** - I'd rather use the identity already attached to my node than manage a
 certificate lifecycle or set up a federated credential at all:
@@ -187,6 +201,10 @@ identity is bound only to the `ClusterRole`s scoped to its own cluster name/name
 isolation every other driver already relies on. This is a property of the existing RBAC model, not an
 action anyone takes, so there is no corresponding `clusteradm` command either.
 
+This isolation assumes each cluster is configured with a distinct Azure AD object ID. Nothing today
+detects or rejects two different `ManagedCluster`s configured with the *same* object ID - see
+[Risks and Mitigation](#risks-and-mitigation).
+
 ### Implementation Details/Notes/Constraints
 
 #### Changes required on the managed cluster
@@ -208,7 +226,7 @@ The subcommand is registered on every binary that could end up in that position:
 #### Changes required on the hub
 
 A `HubDriver` implementation binds the presented identity - as a Kubernetes `User`, keyed by its Azure
-AD principle ID - to the same three `ClusterRole`s a CSR-joined cluster is bound to, once
+AD object (principal) ID - to the same three `ClusterRole`s a CSR-joined cluster is bound to, once
 `hubAcceptsClient` is set to `true`:
 - `open-cluster-management:managedcluster:<clusterName>` (`ClusterRoleBinding`) - status/identity
   permissions for the cluster's own `ManagedCluster` object.
@@ -221,7 +239,9 @@ No new `ClusterRole` is introduced; the identity is added as a subject on existi
 ones any other driver's accepted cluster is bound to.
 
 Automatic approval reuses the existing `ManagedClusterAutoApproval` feature gate: a list of regex
-patterns is matched against the Azure AD object ID on the `managed-cluster-azure-identity` annotation.
+patterns (`--auto-approved-azure-identity-patterns` on the hub, `azure.autoApprovedIdentityPatterns`
+in the `ClusterManager` CR) is matched against the Azure AD object ID on the
+`managed-cluster-azure-identity` annotation.
 
 Unlike a design where the hub controller provisions cloud-provider identities dynamically per managed
 cluster, no Azure resources are created, updated, or deleted by the hub controller at any point in
@@ -230,29 +250,48 @@ this flow. `Cleanup` only removes the Kubernetes RBAC bindings above.
 #### Config surface
 
 A new `authType: azure` option is added to the existing discriminated union already used by other
-registration strategies, on both `ClusterManager.spec.registrationConfiguration` (hub) and
-`Klusterlet.spec.registrationConfiguration` (spoke), mirroring the flags Story 2 adds to `clusteradm
-join`. Two fields are required in every case: `azure.managedClusterAzureID` (the Azure AD
-object/principal ID being claimed - used for hub-side auto-approval matching and RBAC binding) and
-`azure.clientID` (the client ID of that identity). `azure.credential` selects which of the four
-`--azure-credential` values from Story 2 is in use -  `managed-identity-credential`,
-`environment-credential-secret`, `environment-credential-certificate`, or
-`workload-identity-credential` - and determines which further fields apply:
-- `managed-identity-credential` / `workload-identity-credential` need no further fields.
-- `environment-credential-secret` additionally requires `azure.tenantID` and `azure.clientSecret`.
-- `environment-credential-certificate` additionally requires `azure.tenantID`,
-  `azure.clientCertPath`, `azure.clientCertPassword`, and `azure.clientSendCertChain`.
+registration strategies, with a different sub-object shape on each side - there is no shared
+"identity" schema between hub and spoke:
 
-`azure.tokenAudience` stays optional in every case, defaulting to the well-known AKS AAD Server
-application when left unset - see [References](#references).
+- **`Klusterlet.spec.registrationConfiguration.registrationDriver.azure`** (spoke), mirroring the
+  flags Story 2 adds to `clusteradm join`. Two fields are required in every case:
+  `azure.managedClusterAzureID` (the Azure AD object/principal ID being claimed - used for hub-side
+  auto-approval matching and RBAC binding) and `azure.clientID` (the client ID of that identity).
+  `azure.credential` selects which of the four `--azure-credential` values from Story 2 is in use -
+  `managed-identity-credential`, `environment-credential-secret`,
+  `environment-credential-certificate`, or `workload-identity-credential` - and determines which
+  further fields apply:
+  - `managed-identity-credential` / `workload-identity-credential` need no further fields.
+  - `environment-credential-secret` additionally requires `azure.tenantID` and `azure.clientSecret`.
+  - `environment-credential-certificate` additionally requires `azure.tenantID`,
+    `azure.clientCertPath`, `azure.clientCertPassword`, and `azure.clientSendCertChain`.
+
+  `azure.tokenAudience` stays optional in every case, defaulting to the well-known AKS AAD Server
+  application when left unset - see [References](#references). This is a config surface with
+  Helm-chart exposure in mind: each `azure.credential` value corresponds to one chart input form,
+  so the chart can validate exactly the fields that value requires instead of accepting a superset
+  of fields and inferring which are relevant at render time.
+- **`ClusterManager.spec.registrationConfiguration.registrationDriver.azure`** (hub):
+  `azure.autoApprovedIdentityPatterns` (optional, a list of regex patterns matched against a joining
+  cluster's Azure AD object ID for auto-approval), mirroring `awsirsa`'s `autoApprovedARNPatterns`.
+  There is no per-managed-cluster identity field here - the hub's configuration applies uniformly to
+  every cluster that joins with `authType: azure`; a specific cluster's identity lives only on that
+  cluster's own `Klusterlet`.
 
 #### Container image dependency
 
-The only outbound network call this driver makes is the Azure AD token exchange itself
-(`https://login.microsoftonline.com`), a normal public-CA-signed TLS connection. Any base image used
-to build the affected binaries needs a standard root CA trust bundle for this to succeed - a
-certificate-based registration flow never needs to validate a public CA, so a minimal base image built
-for that flow can omit one without anything failing until this specific code path is exercised.
+The Workload Identity Federation and environment-credential paths make one outbound network call:
+the Azure AD token exchange itself (`https://login.microsoftonline.com`), a normal
+public-CA-signed TLS connection. Any base image used to build the affected binaries needs a
+standard root CA trust bundle for this to succeed - a certificate-based registration flow never
+needs to validate a public CA, so a minimal base image built for that flow can omit one without
+anything failing until this specific code path is exercised.
+
+The Managed Identity path instead calls the Azure Instance Metadata Service at the link-local
+address `169.254.169.254` over plain HTTP - no public CA involved, but only reachable from inside
+Azure's own network (a VM, an AKS node, or equivalent). This path fails in any other environment
+regardless of CA trust, and its failure mode is distinct from a CA trust problem - worth surfacing
+as a separate, clearly-labeled error rather than a generic connection failure.
 
 ### Workflow Details
 
@@ -266,8 +305,11 @@ Actors:
 
 #### Managed cluster prerequisites
 
-An Azure AD identity (a user-assigned or system-assigned managed identity, or an app registration), known in advance to
-the managed cluster administrator by its client ID and object ID.
+An Azure AD identity - a user-assigned managed identity, a system-assigned managed identity, or an
+app registration - known in advance to the managed cluster administrator by its client ID and
+object ID. System-assigned managed identities only work with the Managed Identity credential path;
+Workload Identity Federation requires a user-assigned managed identity or an app registration, since
+a system-assigned identity has no separate resource to attach a federated credential to.
 
 For Workload Identity Federation specifically, a federated identity credential on that identity with:
 - **Issuer**: the managed cluster's own OIDC issuer URL.
@@ -283,10 +325,17 @@ that exact ServiceAccount, in that exact namespace, nothing broader.
 
 #### Hub cluster prerequisites
 
-None beyond what the hub controller already has. Accepting a registration request requires only the
-RBAC permission the hub controller's own `ServiceAccount` already holds to create/update
-`ClusterRoleBinding`/`RoleBinding` objects - no Azure credentials, IAM-equivalent role, or additional
-hub-side identity are needed, since the hub controller never calls out to Azure at all.
+The hub *controller* needs nothing beyond what it already has: creating/updating
+`ClusterRoleBinding`/`RoleBinding` objects is covered by its existing `ServiceAccount` permissions,
+and it never calls out to Azure itself.
+
+The hub **API server**, however, must independently be configured, out of band, to authenticate the
+Azure AD access token the agent presents and map its `oid` (object ID) claim to a Kubernetes
+username equal to that same value - either via AKS's native Azure AD integration, or by configuring
+a self-managed apiserver to trust Azure AD as a generic OIDC issuer (`--oidc-issuer-url`,
+`--oidc-client-id`, `--oidc-username-claim=oid`). `AzureAuthHubDriver.CreatePermissions` assumes
+this trust already exists - it only manages the RBAC bindings on top of it, the same way the `csr`
+driver assumes the apiserver already trusts the CA that signs its issued client certificates.
 
 #### Cluster join initiated from the managed cluster
 
@@ -332,6 +381,15 @@ registration agent) may later be read by a different process (e.g. a separately-
 config has to resolve correctly regardless of which binary reads it later - mitigated by every
 relevant binary exposing `get-azure-token` at the same fixed path rather than assuming it can always
 resolve its own executable path at write time.
+
+**No duplicate-identity detection.** Nothing on the hub today rejects two different `ManagedCluster`s
+configured with the same Azure AD object ID, on either the manual or automatic approval path. Should
+that happen - administrator error, or a deliberately reused identity - that one Azure AD identity
+would gain the union of both clusters' RBAC permissions, since both clusters' bindings target the
+same Kubernetes `User` name, undermining the per-cluster isolation described in Story 5. Not
+mitigated in this proposal; called out here as a known limitation. A follow-up could add an admission
+check rejecting a `ManagedCluster` whose annotated object ID already has bindings for a different
+cluster name.
 
 ### Test Plan
 
