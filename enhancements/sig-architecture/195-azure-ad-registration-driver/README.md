@@ -254,23 +254,30 @@ registration strategies, with a different sub-object shape on each side - there 
 "identity" schema between hub and spoke:
 
 - **`Klusterlet.spec.registrationConfiguration.registrationDriver.azure`** (spoke), mirroring the
-  flags Story 2 adds to `clusteradm join`. Two fields are required in every case:
-  `azure.managedClusterAzureID` (the Azure AD object/principal ID being claimed - used for hub-side
-  auto-approval matching and RBAC binding) and `azure.clientID` (the client ID of that identity).
-  `azure.credential` selects which of the four `--azure-credential` values from Story 2 is in use -
-  `managed-identity-credential`, `environment-credential-secret`,
-  `environment-credential-certificate`, or `workload-identity-credential` - and determines which
-  further fields apply:
-  - `managed-identity-credential` / `workload-identity-credential` need no further fields.
-  - `environment-credential-secret` additionally requires `azure.tenantID` and `azure.clientSecret`.
-  - `environment-credential-certificate` additionally requires `azure.tenantID`,
-    `azure.clientCertPath`, `azure.clientCertPassword`, and `azure.clientSendCertChain`.
-
-  `azure.tokenAudience` stays optional in every case, defaulting to the well-known AKS AAD Server
-  application when left unset - see [References](#references). This is a config surface with
-  Helm-chart exposure in mind: each `azure.credential` value corresponds to one chart input form,
-  so the chart can validate exactly the fields that value requires instead of accepting a superset
-  of fields and inferring which are relevant at render time.
+  flags Story 2 adds to `clusteradm join`. Two fields apply regardless of credential type:
+  `azure.managedClusterAzureID` (required in every case - the Azure AD object/principal ID being
+  claimed, used for hub-side auto-approval matching and RBAC binding) and `azure.tokenAudience`
+  (optional in every case, defaulting to the well-known AKS AAD Server application when left unset -
+  see [References](#references)). `azure.credential` selects which of the four `--azure-credential`
+  values from Story 2 is in use, and each one has its own mandatory/optional fields - there is no
+  single required-field set that applies uniformly across all four, since each corresponds to a
+  distinct Helm chart input form that should only validate the fields it actually needs:
+  - **`managed-identity-credential`**: `azure.clientID` is *optional* - set it to use a
+    user-assigned identity, or omit it entirely to fall back to the node's system-assigned identity.
+    No other fields apply.
+  - **`environment-credential-secret`**: `azure.clientID`, `azure.tenantID`, and
+    `azure.clientSecret` are all *required* - a secret-based service principal always has a client
+    ID and tenant.
+  - **`environment-credential-certificate`**: `azure.clientID`, `azure.tenantID`, and
+    `azure.clientCertPath` are *required*; `azure.clientCertPassword` is *optional* (only needed if
+    the certificate file is itself password-protected), and `azure.clientSendCertChain` is
+    *optional*, defaulting to `false`.
+  - **`workload-identity-credential`**: `azure.clientID` is *required* - unlike Managed Identity,
+    there is no system-assigned equivalent for Workload Identity Federation (see [Managed cluster
+    prerequisites](#managed-cluster-prerequisites)), so a specific identity must always be named.
+    `azure.tenantID` and `azure.federatedTokenFile` are *optional*: both are normally auto-injected
+    onto the pod by the Azure Workload Identity mutating webhook, and these fields exist only to
+    override that.
 - **`ClusterManager.spec.registrationConfiguration.registrationDriver.azure`** (hub):
   `azure.autoApprovedIdentityPatterns` (optional, a list of regex patterns matched against a joining
   cluster's Azure AD object ID for auto-approval), mirroring `awsirsa`'s `autoApprovedARNPatterns`.
