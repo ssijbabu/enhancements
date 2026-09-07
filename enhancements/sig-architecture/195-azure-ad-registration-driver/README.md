@@ -108,20 +108,22 @@ system-assigned identity instead:
 ```
 
 **Existing credential pipeline (environment variables)** - a client secret or certificate is already
-provisioned by infrastructure I don't want to change. `clusteradm` takes the secret/certificate as
-CLI input purely for my convenience at join time; it never writes the value into the `Klusterlet` CR
-or into a Pod's `env[].value` as a literal. Instead it creates a Kubernetes `Secret` holding the
-material and configures the klusterlet agent's container to consume it via `env[].valueFrom.secretKeyRef`
-- the standard way a Pod exposes a `Secret` as an environment variable without the value ever
-appearing in the Pod spec itself, resolving to the same `AZURE_CLIENT_SECRET` /
-`AZURE_CLIENT_CERTIFICATE_PATH`/`AZURE_CLIENT_CERTIFICATE_PASSWORD` variables the driver's
-`EnvironmentCredential` already reads at runtime. Only the non-secret identifying fields -
-`azure.clientID`, `azure.tenantID` - end up in the CR itself.
+provisioned by infrastructure I don't want to change. `clusteradm` never accepts the secret value
+itself as a CLI flag - unlike a flag's value, argv is visible to any local user or process that can
+read `/proc/<pid>/cmdline` (or a shell history) while `clusteradm` runs, secret or not. Instead the
+secret-bearing flags below are boolean switches that make `clusteradm` read the value from **stdin**;
+it then creates a Kubernetes `Secret` holding that value and configures the klusterlet agent's
+container to consume it via `env[].valueFrom.secretKeyRef` - the standard way a Pod exposes a
+`Secret` as an environment variable without the value ever appearing in the Pod spec itself,
+resolving to the same `AZURE_CLIENT_SECRET`/`AZURE_CLIENT_CERTIFICATE_PATH`/
+`AZURE_CLIENT_CERTIFICATE_PASSWORD` variables the driver's `EnvironmentCredential` already reads at
+runtime. Only the non-secret identifying fields - `azure.clientID`, `azure.tenantID` - end up in the
+CR itself.
 
 **Service Principal with Secret**
 
 ```
-% clusteradm join \
+% echo -n '<client-secret-of-service-principal>' | clusteradm join \
      --registration-auth=azure \
      --hub-token XXX \
      --hub-apiserver https://hub-0.k8s.example.com \
@@ -129,18 +131,19 @@ appearing in the Pod spec itself, resolving to the same `AZURE_CLIENT_SECRET` /
      --azure-credential environment-credential-secret \
      --azure-tenant-id <tenant-id-of-service-principal> \
      --azure-client-id <client-id-of-service-principal> \
-     --azure-client-secret <client-secret-of-service-principal> \
+     --azure-client-secret-stdin \
      --cluster-name managed-0
 ```
 
-`--azure-client-secret`'s value goes into the `Secret`/`secretKeyRef` described above, never the CR -
-only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `azure.tenantID`/
+`--azure-client-secret-stdin` tells `clusteradm` to read the secret from stdin rather than take it as
+a flag value - never appearing in argv, the `Secret`/`secretKeyRef` described above, never the CR.
+Only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `azure.tenantID`/
 `azure.clientID`.
 
 **Service Principal with Certificate**
 
 ```
-% clusteradm join \
+% echo -n '<certificate-password-of-service-principal>' | clusteradm join \
      --registration-auth=azure \
      --hub-token XXX \
      --hub-apiserver https://hub-0.k8s.example.com \
@@ -149,17 +152,18 @@ only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `a
      --azure-tenant-id <tenant-id-of-service-principal> \
      --azure-client-id <client-id-of-service-principal> \
      --azure-client-cert-path <local-certificate-path-of-service-principal> \
-     --azure-client-cert-password <certificate-password-of-service-principal> \
+     --azure-client-cert-password-stdin \
      --azure-client-send-cert-chain <true/false> \
      --cluster-name managed-0
 ```
 
 `--azure-client-cert-path` here is a path on the machine running `clusteradm`, read once to build the
-`Secret` above - not a path inside the agent's container, and never stored anywhere itself.
-`--azure-client-cert-password` and `--azure-client-send-cert-chain` both go into that same `Secret`
-too - `clientSendCertChain` isn't secret material itself, but it's meaningless without the
-certificate it describes, so it travels alongside it as an environment variable rather than
-splitting one credential across a `Secret` and the CR.
+`Secret` above - not a path inside the agent's container, and never stored anywhere itself; a path
+isn't credential material, so it's fine as a regular flag. The password is different, so
+`--azure-client-cert-password-stdin` reads it the same way as the secret above - never appearing in
+argv. `--azure-client-send-cert-chain` goes into that same `Secret` too - it isn't secret material
+itself, but it's meaningless without the certificate it describes, so it travels alongside it as an
+environment variable rather than splitting one credential across a `Secret` and the CR.
 
 **Workload Identity Federation** - I run under a policy that forbids storing long-lived credentials
 on a cluster. My Azure AD identity's federated credential is already configured against my managed
