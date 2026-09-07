@@ -108,9 +108,15 @@ system-assigned identity instead:
 ```
 
 **Existing credential pipeline (environment variables)** - a client secret or certificate is already
-provisioned by infrastructure I don't want to change. Neither the secret nor the certificate is ever
-passed as a flag or stored in any OCM resource - only the identifying metadata below is; the driver
-reads the credential material itself straight from the environment at runtime.
+provisioned by infrastructure I don't want to change. `clusteradm` takes the secret/certificate as
+CLI input purely for my convenience at join time; it never writes the value into the `Klusterlet` CR
+or into a Pod's `env[].value` as a literal. Instead it creates a Kubernetes `Secret` holding the
+material and configures the klusterlet agent's container to consume it via `env[].valueFrom.secretKeyRef`
+- the standard way a Pod exposes a `Secret` as an environment variable without the value ever
+appearing in the Pod spec itself, resolving to the same `AZURE_CLIENT_SECRET` /
+`AZURE_CLIENT_CERTIFICATE_PATH`/`AZURE_CLIENT_CERTIFICATE_PASSWORD` variables the driver's
+`EnvironmentCredential` already reads at runtime. Only the non-secret identifying fields -
+`azure.clientID`, `azure.tenantID` - end up in the CR itself.
 
 **Service Principal with Secret**
 
@@ -127,6 +133,10 @@ reads the credential material itself straight from the environment at runtime.
      --cluster-name managed-0
 ```
 
+`--azure-client-secret`'s value goes into the `Secret`/`secretKeyRef` described above, never the CR -
+only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `azure.tenantID`/
+`azure.clientID`.
+
 **Service Principal with Certificate**
 
 ```
@@ -138,11 +148,16 @@ reads the credential material itself straight from the environment at runtime.
      --azure-principle-id <principle-id-of-the-service-principle>
      --azure-tenant-id <tenant-id-of-service-principal> \
      --azure-client-id <client-id-of-service-principal> \
-     --azure-client-cert-path <certificate-path-of-service-principal> \
+     --azure-client-cert-path <local-certificate-path-of-service-principal> \
      --azure-client-cert-password <certificate-password-of-service-principal> \
      --azure-client-send-cert-chain <true/false> \
      --cluster-name managed-0
 ```
+
+`--azure-client-cert-path` here is a path on the machine running `clusteradm`, read once to build the
+`Secret` above - not a path inside the agent's container, and never stored anywhere itself.
+`--azure-client-cert-password` goes into that same `Secret`. `--azure-client-send-cert-chain` isn't
+secret material, just a boolean, and does land in the CR as `azure.clientSendCertChain`.
 
 **Workload Identity Federation** - I run under a policy that forbids storing long-lived credentials
 on a cluster. My Azure AD identity's federated credential is already configured against my managed
@@ -293,13 +308,14 @@ registration strategies, with a different sub-object shape on each side - there 
   - **`managed-identity-credential`**: `azure.clientID` is *optional* - set it to use a
     user-assigned identity, or omit it entirely to fall back to the node's system-assigned identity.
     No other fields apply.
-  - **`environment-credential-secret`**: `azure.clientID`, `azure.tenantID`, and
-    `azure.clientSecret` are all *required* - a secret-based service principal always has a client
-    ID and tenant.
-  - **`environment-credential-certificate`**: `azure.clientID`, `azure.tenantID`, and
-    `azure.clientCertPath` are *required*; `azure.clientCertPassword` is *optional* (only needed if
-    the certificate file is itself password-protected), and `azure.clientSendCertChain` is
-    *optional*, defaulting to `false`.
+  - **`environment-credential-secret`**: `azure.clientID` and `azure.tenantID` are *required* - a
+    secret-based service principal always has a client ID and tenant. The client secret itself is
+    never a CR field - it reaches the agent only as a `Secret`-backed environment variable (see
+    Story 2), so it's absent from this list entirely, not merely optional.
+  - **`environment-credential-certificate`**: `azure.clientID` and `azure.tenantID` are *required*;
+    `azure.clientSendCertChain` is *optional*, defaulting to `false`. Like the client secret above,
+    the certificate and its password are never CR fields - both reach the agent only as
+    `Secret`-backed environment variables.
   - **`workload-identity-credential`**: `azure.clientID` is *required* - unlike Managed Identity,
     there is no system-assigned equivalent for Workload Identity Federation (see [Managed cluster
     prerequisites](#managed-cluster-prerequisites)), so a specific identity must always be named.
