@@ -92,7 +92,9 @@ distinct, independently-validated input shapes instead of one chart path whose e
 depends on which environment variables happen to be set at deploy time:
 
 **Managed Identity** - I'd rather use the identity already attached to my node than manage a
-certificate lifecycle or set up a federated credential at all:
+certificate lifecycle or set up a federated credential at all. `--azure-client-id` is optional here:
+provide it to use a specific user-assigned identity, or omit it entirely to use the node's
+system-assigned identity instead:
 
 ```
 % clusteradm join \
@@ -101,7 +103,7 @@ certificate lifecycle or set up a federated credential at all:
      --hub-apiserver https://hub-0.k8s.example.com \
      --azure-credential managed-identity-credential \
      --azure-principle-id <principle-id-of-the-service-principle>
-     --azure-client-id <client-id-of-user/system-assigned-identity> \
+     --azure-client-id <client-id-of-user-assigned-identity> \   # omit for system-assigned
      --cluster-name managed-0
 ```
 
@@ -278,9 +280,13 @@ registration strategies, with a different sub-object shape on each side - there 
 - **`Klusterlet.spec.registrationConfiguration.registrationDriver.azure`** (spoke), mirroring the
   flags Story 2 adds to `clusteradm join`. Two fields apply regardless of credential type:
   `azure.managedClusterAzureID` (required in every case - the Azure AD object/principal ID being
-  claimed, used for hub-side auto-approval matching and RBAC binding) and `azure.tokenAudience`
-  (optional in every case, defaulting to the well-known AKS AAD Server application when left unset -
-  see [References](#references)). `azure.credential` selects which of the four `--azure-credential`
+  claimed, set via `--azure-principle-id` in Story 2, used for hub-side auto-approval matching and
+  RBAC binding) and `azure.tokenAudience`. `azure.tokenAudience` is only safely left unset for
+  AKS's native Azure AD integration, where it defaults to the well-known AKS AAD Server application
+  - see [References](#references). For a self-managed apiserver it is effectively required: it must
+  be set to match whatever `--oidc-client-id` that apiserver is configured with (see [Hub cluster
+  prerequisites](#hub-cluster-prerequisites)), and the AKS default is very unlikely to match an
+  arbitrary self-managed apiserver's own client ID. `azure.credential` selects which of the four `--azure-credential`
   values from Story 2 is in use, and each one has its own mandatory/optional fields - there is no
   single required-field set that applies uniformly across all four, since each corresponds to a
   distinct Helm chart input form that should only validate the fields it actually needs:
@@ -383,7 +389,20 @@ and it never calls out to Azure itself.
 
 The hub **API server**, however, must independently be configured, out of band, to authenticate the
 Azure AD access token the agent presents - either via AKS's native Azure AD integration, or by
-configuring a self-managed apiserver to trust Azure AD as a generic OIDC issuer:
+configuring a self-managed apiserver to trust Azure AD as a generic OIDC issuer.
+
+**AKS's native Azure AD integration**: the hub AKS cluster must be created or updated with Azure AD
+integration enabled (`az aks create/update --enable-aad`), and - specifically - **without** Azure
+RBAC for Kubernetes Authorization (`--enable-azure-rbac`). That mode replaces Kubernetes-native RBAC
+with Azure role assignments as the actual authorization mechanism, which would make the
+`ClusterRoleBinding`/`RoleBinding` objects `AzureAuthHubDriver.CreatePermissions` creates
+irrelevant to whether access is actually granted. With plain `--enable-aad` (Azure AD integration
+for *authentication* only, standard Kubernetes RBAC for *authorization*), AKS maps the presented
+identity's `oid` claim directly to the Kubernetes username, unprefixed - no `azure.oidcIssuerURL`
+or further hub configuration is needed for this path, and `azure.tokenAudience` can be left unset to
+take AKS's own default.
+
+**A self-managed apiserver trusting Azure AD as a generic OIDC issuer**:
 
 ```text
 --oidc-issuer-url=https://login.microsoftonline.com/<tenant-id>/v2.0
