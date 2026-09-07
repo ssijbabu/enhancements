@@ -492,9 +492,10 @@ by object ID) in this proposal.
 
 ### Test Plan
 
-- Unit tests for the credential-chain fallback logic and the hub-side RBAC binding/approval logic, in
-  isolation, without a real Azure identity - including `CreatePermissions` refusing to bind a second
-  cluster name to an object ID already bound to a different one.
+- Unit tests for each of the four `azure.credential` shapes (correct construction from valid input,
+  and rejection of missing/invalid required fields per shape), and for the hub-side RBAC
+  binding/approval logic, in isolation, without a real Azure identity - including `CreatePermissions`
+  refusing to bind a second cluster name to an object ID already bound to a different one.
 - Integration tests (envtest) for the hub driver's `CreatePermissions`/`Cleanup`/`Accept` behavior.
 - Verification against a real Azure identity, since the specific failure modes here are about real
   credential exchange and real RBAC - not something envtest or a fake client exercises. Before this is
