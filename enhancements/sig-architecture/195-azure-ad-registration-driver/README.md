@@ -225,9 +225,20 @@ The subcommand is registered on every binary that could end up in that position:
 
 #### Changes required on the hub
 
-A `HubDriver` implementation binds the presented identity - as a Kubernetes `User`, keyed by its Azure
-AD object (principal) ID - to the same three `ClusterRole`s a CSR-joined cluster is bound to, once
-`hubAcceptsClient` is set to `true`:
+A `HubDriver` implementation binds the presented identity - as a Kubernetes `User` - to the same
+three `ClusterRole`s a CSR-joined cluster is bound to, once `hubAcceptsClient` is set to `true`. The
+exact subject name it binds to depends on which apiserver-side trust is in place:
+- **AKS's native Azure AD integration**: the bare Azure AD object (principal) ID.
+- **A self-managed apiserver trusting Azure AD as a generic OIDC issuer**: kube-apiserver's default
+  username-prefix behavior applies whenever `--oidc-username-claim` is set to something other than
+  `email` and no `--oidc-username-prefix` is given - the authenticated username becomes
+  `<oidc-issuer-url>#<object-id>`, not the bare ID (see [Hub cluster
+  prerequisites](#hub-cluster-prerequisites)). `AzureAuthHubDriver` reproduces that same prefixed
+  form when binding RBAC, using a configured `azure.oidcIssuerURL` value (see [Config
+  surface](#config-surface)) - left unset for the AKS-native case, where the bare ID is used
+  directly. This value must be byte-for-byte identical to whatever the apiserver is actually
+  configured with via `--oidc-issuer-url`; even a trailing-slash difference produces a username that
+  doesn't match, so the token still validates but every authorization check then fails with a 403.
 - `open-cluster-management:managedcluster:<clusterName>` (`ClusterRoleBinding`) - status/identity
   permissions for the cluster's own `ManagedCluster` object.
 - `open-cluster-management:managedcluster:<clusterName>:registration` (`RoleBinding` to the shared
@@ -280,10 +291,14 @@ registration strategies, with a different sub-object shape on each side - there 
     override that.
 - **`ClusterManager.spec.registrationConfiguration.registrationDriver.azure`** (hub):
   `azure.autoApprovedIdentityPatterns` (optional, a list of regex patterns matched against a joining
-  cluster's Azure AD object ID for auto-approval), mirroring `awsirsa`'s `autoApprovedARNPatterns`.
-  There is no per-managed-cluster identity field here - the hub's configuration applies uniformly to
-  every cluster that joins with `authType: azure`; a specific cluster's identity lives only on that
-  cluster's own `Klusterlet`.
+  cluster's Azure AD object ID for auto-approval), mirroring `awsirsa`'s `autoApprovedARNPatterns`;
+  and `azure.oidcIssuerURL` (optional, unset for AKS's native Azure AD integration - set only when
+  the hub apiserver instead trusts Azure AD as a generic OIDC issuer, to the exact
+  `--oidc-issuer-url` value configured there, so `AzureAuthHubDriver` can reproduce the same
+  default-prefixed username the apiserver derives - see [Changes required on the
+  hub](#changes-required-on-the-hub)). There is no per-managed-cluster identity field here - the
+  hub's configuration applies uniformly to every cluster that joins with `authType: azure`; a
+  specific cluster's identity lives only on that cluster's own `Klusterlet`.
 
 #### Container image dependency
 
@@ -337,12 +352,34 @@ The hub *controller* needs nothing beyond what it already has: creating/updating
 and it never calls out to Azure itself.
 
 The hub **API server**, however, must independently be configured, out of band, to authenticate the
-Azure AD access token the agent presents and map its `oid` (object ID) claim to a Kubernetes
-username equal to that same value - either via AKS's native Azure AD integration, or by configuring
-a self-managed apiserver to trust Azure AD as a generic OIDC issuer (`--oidc-issuer-url`,
-`--oidc-client-id`, `--oidc-username-claim=oid`). `AzureAuthHubDriver.CreatePermissions` assumes
-this trust already exists - it only manages the RBAC bindings on top of it, the same way the `csr`
-driver assumes the apiserver already trusts the CA that signs its issued client certificates.
+Azure AD access token the agent presents - either via AKS's native Azure AD integration, or by
+configuring a self-managed apiserver to trust Azure AD as a generic OIDC issuer:
+
+```
+--oidc-issuer-url=https://login.microsoftonline.com/<tenant-id>/v2.0
+--oidc-client-id=<the audience configured as azure.tokenAudience>
+--oidc-username-claim=oid
+```
+
+`--oidc-username-prefix` is deliberately left unset, taking kube-apiserver's default: since
+`--oidc-username-claim` is set to something other than `email`, the resulting Kubernetes username is
+`<oidc-issuer-url>#<oid>`, not the bare object ID - this default exists to avoid username collisions
+across multiple trusted issuers. `AzureAuthHubDriver` accounts for this by constructing the same
+prefixed form when binding RBAC (see [Changes required on the hub](#changes-required-on-the-hub)),
+using the `azure.oidcIssuerURL` value configured on the hub. That value must be byte-for-byte
+identical to the `--oidc-issuer-url` given here - even a trailing-slash difference produces a
+username the RBAC bindings don't match, so the token still validates but every authorization check
+then fails with a 403.
+
+`--oidc-client-id` must equal whatever `azure.tokenAudience` is configured on the spoke (see [Config
+surface](#config-surface)) - the apiserver only accepts tokens whose audience matches its configured
+client ID. This is specific to the self-managed apiserver path: AKS's native Azure AD integration
+has its own default audience (the well-known AKS AAD Server application `azure.tokenAudience`
+defaults to), which does not apply when trusting Azure AD as a generic OIDC issuer instead.
+
+`AzureAuthHubDriver.CreatePermissions` assumes this trust already exists - it only manages the RBAC
+bindings on top of it, the same way the `csr` driver assumes the apiserver already trusts the CA
+that signs its issued client certificates.
 
 #### Cluster join initiated from the managed cluster
 
