@@ -156,8 +156,10 @@ only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `a
 
 `--azure-client-cert-path` here is a path on the machine running `clusteradm`, read once to build the
 `Secret` above - not a path inside the agent's container, and never stored anywhere itself.
-`--azure-client-cert-password` goes into that same `Secret`. `--azure-client-send-cert-chain` isn't
-secret material, just a boolean, and does land in the CR as `azure.clientSendCertChain`.
+`--azure-client-cert-password` and `--azure-client-send-cert-chain` both go into that same `Secret`
+too - `clientSendCertChain` isn't secret material itself, but it's meaningless without the
+certificate it describes, so it travels alongside it as an environment variable rather than
+splitting one credential across a `Secret` and the CR.
 
 **Workload Identity Federation** - I run under a policy that forbids storing long-lived credentials
 on a cluster. My Azure AD identity's federated credential is already configured against my managed
@@ -312,10 +314,10 @@ registration strategies, with a different sub-object shape on each side - there 
     secret-based service principal always has a client ID and tenant. The client secret itself is
     never a CR field - it reaches the agent only as a `Secret`-backed environment variable (see
     Story 2), so it's absent from this list entirely, not merely optional.
-  - **`environment-credential-certificate`**: `azure.clientID` and `azure.tenantID` are *required*;
-    `azure.clientSendCertChain` is *optional*, defaulting to `false`. Like the client secret above,
-    the certificate and its password are never CR fields - both reach the agent only as
-    `Secret`-backed environment variables.
+  - **`environment-credential-certificate`**: `azure.clientID` and `azure.tenantID` are *required*.
+    The certificate, its password, and whether to send the certificate chain are never CR fields -
+    all three travel together as `Secret`-backed environment variables (see Story 2), since
+    `clientSendCertChain` only means anything alongside the certificate it modifies.
   - **`workload-identity-credential`**: `azure.clientID` is *required* - unlike Managed Identity,
     there is no system-assigned equivalent for Workload Identity Federation (see [Managed cluster
     prerequisites](#managed-cluster-prerequisites)), so a specific identity must always be named.
