@@ -201,9 +201,10 @@ identity is bound only to the `ClusterRole`s scoped to its own cluster name/name
 isolation every other driver already relies on. This is a property of the existing RBAC model, not an
 action anyone takes, so there is no corresponding `clusteradm` command either.
 
-This isolation assumes each cluster is configured with a distinct Azure AD object ID. Nothing today
-detects or rejects two different `ManagedCluster`s configured with the *same* object ID - see
-[Risks and Mitigation](#risks-and-mitigation).
+This isolation assumes each cluster is configured with a distinct Azure AD object ID.
+`AzureAuthHubDriver.CreatePermissions` enforces that: before binding RBAC for a cluster, it checks
+whether that object ID already has bindings under a *different* cluster name and, if so, refuses to
+create them - see [Changes required on the hub](#changes-required-on-the-hub).
 
 ### Implementation Details/Notes/Constraints
 
@@ -248,6 +249,16 @@ exact subject name it binds to depends on which apiserver-side trust is in place
 
 No new `ClusterRole` is introduced; the identity is added as a subject on existing roles, the same
 ones any other driver's accepted cluster is bound to.
+
+Each `ClusterRoleBinding`/`RoleBinding` `CreatePermissions` creates is labeled with the Azure AD
+object ID it was created for, in addition to the existing cluster-name label. Before creating
+bindings for a cluster, `CreatePermissions` lists existing bindings carrying that same object-ID
+label; if any belong to a *different* cluster name, it refuses to create the new bindings and
+returns an error instead, which surfaces as a failed/retrying condition on the `ManagedCluster`
+rather than a silent, incorrectly-shared grant of access. This runs on every acceptance path -
+manual (`hubAcceptsClient: true`) and automatic alike - since `CreatePermissions` is called
+regardless of which one accepted the cluster, unlike `Accept`, which only runs for automatic
+approval.
 
 Automatic approval reuses the existing `ManagedClusterAutoApproval` feature gate: a list of regex
 patterns (`--auto-approved-azure-identity-patterns` on the hub, `azure.autoApprovedIdentityPatterns`
@@ -333,17 +344,36 @@ object ID. System-assigned managed identities only work with the Managed Identit
 Workload Identity Federation requires a user-assigned managed identity or an app registration, since
 a system-assigned identity has no separate resource to attach a federated credential to.
 
-For Workload Identity Federation specifically, a federated identity credential on that identity with:
-- **Issuer**: the managed cluster's own OIDC issuer URL.
-- **Subject**: `system:serviceaccount:<agent-namespace>:<klusterlet-name>-registration-sa`, and a
-  second federated credential with subject
-  `system:serviceaccount:<agent-namespace>:<klusterlet-name>-work-sa` (in `Singleton`/`SingletonHosted`
-  mode, registration and work share one ServiceAccount, so only the `-work-sa` subject is needed).
-- **Audience**: `api://AzureADTokenExchange`.
+For Workload Identity Federation specifically, a federated identity credential on that identity,
+whose **Issuer** depends on which cluster actually runs the agent pod - not which cluster is being
+managed:
+
+- **`Default`/`Singleton`**: the agent pod runs on the managed cluster itself, so **Issuer** is the
+  managed cluster's own OIDC issuer URL, and the Azure Workload Identity mutating webhook must be
+  installed on the managed cluster.
+- **`Hosted`/`SingletonHosted`**: the klusterlet agent runs entirely on a separate hosting cluster -
+  the managed cluster is only ever reached remotely via an `external-managed-kubeconfig`, nothing
+  from the agent runs on it. The projected ServiceAccount token is therefore signed by the
+  **hosting cluster's** OIDC issuer, so **Issuer** must be the hosting cluster's issuer URL, and the
+  mutating webhook must be installed on the hosting cluster instead. Using the managed cluster's
+  issuer here doesn't degrade gracefully - Azure AD rejects the token exchange outright, since the
+  real token's `iss` claim never matches what the federated credential trusts.
+
+In every mode, the **Subject** is `system:serviceaccount:<agent-namespace>:<klusterlet-name>-registration-sa`,
+plus a second federated credential with subject
+`system:serviceaccount:<agent-namespace>:<klusterlet-name>-work-sa` (in `Singleton`/`SingletonHosted`
+mode, registration and work share one ServiceAccount, so only the `-work-sa` subject is needed) -
+`<agent-namespace>` is wherever the agent actually runs (the managed cluster's own namespace in
+`Default`/`Singleton`; a namespace on the hosting cluster, typically named after the managed
+cluster, in `Hosted`/`SingletonHosted`). **Audience** is `api://AzureADTokenExchange` in every mode.
 
 This subject-matching is structurally the same idea as any federated-identity trust condition scoped
 to a specific Kubernetes ServiceAccount - the identity can only be assumed by a token presented by
-that exact ServiceAccount, in that exact namespace, nothing broader.
+that exact ServiceAccount, in that exact namespace, nothing broader. Getting the issuer wrong for a
+mode other than the default is exactly the kind of silent, mode-specific misconfiguration called out
+in [Risks and Mitigation](#risks-and-mitigation) - it fails at registration time, not at deploy time,
+and unlike a bad pod label or ServiceAccount annotation, there's no fallback credential source to
+silently fall through to.
 
 #### Hub cluster prerequisites
 
@@ -355,7 +385,7 @@ The hub **API server**, however, must independently be configured, out of band, 
 Azure AD access token the agent presents - either via AKS's native Azure AD integration, or by
 configuring a self-managed apiserver to trust Azure AD as a generic OIDC issuer:
 
-```
+```text
 --oidc-issuer-url=https://login.microsoftonline.com/<tenant-id>/v2.0
 --oidc-client-id=<the audience configured as azure.tokenAudience>
 --oidc-username-claim=oid
@@ -426,19 +456,26 @@ config has to resolve correctly regardless of which binary reads it later - miti
 relevant binary exposing `get-azure-token` at the same fixed path rather than assuming it can always
 resolve its own executable path at write time.
 
-**No duplicate-identity detection.** Nothing on the hub today rejects two different `ManagedCluster`s
-configured with the same Azure AD object ID, on either the manual or automatic approval path. Should
-that happen - administrator error, or a deliberately reused identity - that one Azure AD identity
-would gain the union of both clusters' RBAC permissions, since both clusters' bindings target the
-same Kubernetes `User` name, undermining the per-cluster isolation described in Story 5. Not
-mitigated in this proposal; called out here as a known limitation. A follow-up could add an admission
-check rejecting a `ManagedCluster` whose annotated object ID already has bindings for a different
-cluster name.
+**Duplicate identity across clusters.** Without a check, two different `ManagedCluster`s configured
+with the same Azure AD object ID - administrator error, or a deliberately reused identity - would
+each get their own RBAC bindings targeting the same Kubernetes `User` name, so that one identity
+would end up with the union of both clusters' permissions, undermining the per-cluster isolation
+described in Story 5. Mitigated by `CreatePermissions` itself refusing to bind a second cluster name
+to an object ID already bound to a different one (see [Changes required on the
+hub](#changes-required-on-the-hub)), on both the manual and automatic approval paths. This is a
+check-then-act comparison against existing `ClusterRoleBinding`/`RoleBinding` objects rather than an
+atomic, server-enforced constraint - two clusters with the same identity racing through
+`CreatePermissions` at nearly the same instant could theoretically both pass the check before either
+finishes creating its bindings. Given this requires either administrator error or a deliberately
+reused identity to trigger at all, the residual race is treated as an accepted, low-probability edge
+case rather than something warranting an atomic claim mechanism (e.g. a dedicated lock object keyed
+by object ID) in this proposal.
 
 ### Test Plan
 
 - Unit tests for the credential-chain fallback logic and the hub-side RBAC binding/approval logic, in
-  isolation, without a real Azure identity.
+  isolation, without a real Azure identity - including `CreatePermissions` refusing to bind a second
+  cluster name to an object ID already bound to a different one.
 - Integration tests (envtest) for the hub driver's `CreatePermissions`/`Cleanup`/`Accept` behavior.
 - Verification against a real Azure identity, since the specific failure modes here are about real
   credential exchange and real RBAC - not something envtest or a fake client exercises. Before this is
