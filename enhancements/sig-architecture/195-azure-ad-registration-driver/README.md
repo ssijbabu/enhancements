@@ -131,7 +131,7 @@ up in the CR itself.
 
 **Service Principal with Secret**
 
-```
+```shell
 % read -s -p 'Client secret: ' CLIENT_SECRET && echo
 % clusteradm join \
      --registration-auth=azure \
@@ -155,7 +155,7 @@ Only `--azure-tenant-id` and `--azure-client-id` land in `Klusterlet.spec` as `a
 
 **Service Principal with Certificate**
 
-```
+```shell
 % read -s -p 'Certificate password: ' CERT_PASSWORD && echo
 % clusteradm join \
      --registration-auth=azure \
@@ -180,9 +180,11 @@ plain string, not sourced via `secretKeyRef` from the `Secret` - `secretKeyRef` 
 value into an env var and cannot place a file on disk, so a certificate handled that way would never
 be readable by `EnvironmentCredential` at runtime. As with the client secret, the password is read
 via `read -s` and piped in as a here-string, so `--azure-client-cert-password-stdin` never sees it as
-an argv token. `--azure-client-send-cert-chain` goes into that same `Secret` too - it isn't secret
-material itself, but it's meaningless without the certificate it describes, so it travels alongside
-it as a mounted-file sibling rather than splitting one credential across a `Secret` and the CR.
+an argv token. `--azure-client-send-cert-chain` is different again: `EnvironmentCredential` reads it
+as the boolean `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` environment variable, not from a file, so it
+goes into the same `Secret` as a string value and reaches the container via `secretKeyRef` like
+`AZURE_CLIENT_SECRET` - it isn't secret material itself, but it's meaningless without the
+certificate it describes, so it travels alongside it in the `Secret` rather than the CR.
 
 **Workload Identity Federation** - I run under a policy that forbids storing long-lived credentials
 on a cluster. My Azure AD identity's federated credential is already configured against my managed
@@ -203,8 +205,17 @@ In every case, the resulting Azure AD access token - the credential presented to
 apiserver - is obtained fresh via the exec credential plugin and held only in memory; it is never
 written to disk, a `Secret`, or `Klusterlet.spec`. This is distinct from the *input* credential
 (client secret or certificate password): as described above, that is intentionally persisted as a
-Kubernetes `Secret` on the managed cluster so the agent can re-authenticate and mint new tokens
-after a restart or a rotation.
+Kubernetes `Secret` on the managed cluster so the agent can re-authenticate and mint new tokens.
+
+Rotating that input credential (e.g. issuing a new client secret and updating the `Secret`) does
+**not** take effect on its own for `AZURE_CLIENT_SECRET`/`AZURE_CLIENT_CERTIFICATE_PASSWORD`/
+`AZURE_CLIENT_SEND_CERTIFICATE_CHAIN`: `env[].valueFrom.secretKeyRef` values are resolved once when
+the container starts, and the kubelet does not re-inject them into a running process, so the agent
+keeps using the old value until its Pod restarts. The certificate file itself is the exception -
+Kubernetes refreshes a mounted `Secret` volume's file contents in place on a change, without a
+restart. Rotating a client secret or certificate password therefore requires restarting or rolling
+out the klusterlet agent afterward (e.g. `kubectl rollout restart`) to pick up the new value; this
+should be exercised as part of testing old-credential revocation followed by a `Secret` update.
 
 #### Story 3 - Hub administrator accepts a managed cluster's registration request
 
