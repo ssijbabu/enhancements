@@ -132,6 +132,32 @@ flowchart LR
    connection. The hub creates or updates the `ManagedCluster` named in the SPIFFE ID, records the
    SPIFFE ID on it, and waits for acceptance. No credential is issued.
 
+### Component interactions
+
+Besides its local SPIRE agent, each OCM component talks to the following. Connections that cross a
+cluster boundary use SPIFFE; connections to a component's own local kube-apiserver keep using
+Kubernetes' projected ServiceAccount tokens, which are out of scope.
+
+| OCM component | Talks to | Credential |
+|---|---|---|
+| Klusterlet agents (registration, work, singleton) | gRPC server SPIFFE listener | X.509-SVID, mutual TLS |
+| | Local managed cluster kube-apiserver: applies `ManifestWork`, writes `AppliedManifestWork`, ClusterClaims, leases and addon kubeconfig Secrets | Projected ServiceAccount token |
+| | Remote managed cluster kube-apiserver (Hosted modes only) | JWT-SVID through the `exec` credential plugin |
+| Addon agents | gRPC server: addon status, lease, events, `TokenRequest` | X.509-SVID, mutual TLS |
+| | Addon's own hub component (optional) | X.509-SVID, mutual TLS |
+| | Hub kube-apiserver (only addons that watch hub resources) | ServiceAccount token from the token helper |
+| | Local managed cluster kube-apiserver | Projected ServiceAccount token |
+| gRPC server | Hub kube-apiserver: hub resources on agents' behalf, SubjectAccessReview, `TokenRequest` | Projected ServiceAccount token |
+| Hub controllers (registration, work, placement, addon-manager) | Hub kube-apiserver | Projected ServiceAccount token; JWT-SVID in Hosted ClusterManager |
+| Hub webhooks | Called by the hub kube-apiserver | Webhook serves its X.509-SVID; the apiserver verifies it through `caBundle` (one-way) |
+| Cluster-manager operator | Hub kube-apiserver, including `caBundle` sync | Projected ServiceAccount token; JWT-SVID in Hosted ClusterManager |
+| Klusterlet operator | Local kube-apiserver; managed cluster kube-apiserver in Hosted modes | Projected ServiceAccount token; JWT-SVID in Hosted modes |
+
+OCM components never talk to the SPIRE server, the OIDC discovery provider or the JWT issuer. The
+remote kube-apiserver uses the issuer to verify JWT-SVIDs in Hosted modes, and federation runs
+between SPIRE servers. Between agents and the gRPC server there is only a layer-4 load balancer
+that passes TLS through.
+
 ### Registration: today vs. `spiffe`
 
 | Step | `csr` / `grpc` today | `spiffe` |
