@@ -19,7 +19,7 @@ certificate, and the hub signs it with its own CA. With the `spiffe` driver, eve
 identities to **authenticate each other on every connection**:
 
 - The klusterlet agent proves it is `spiffe://<td>/ocm/managedcluster/<c>/klusterlet`, and accepts
-  the hub only if the hub proves it is `spiffe://<hub-td>/ocm/hub/grpc-server`.
+  the hub only if the hub proves it is `spiffe://<td>/ocm/hub/grpc-server`.
 - An addon agent proves it is `…/ocm/managedcluster/<c>/addon/<a>`, and accepts only the hub, or
   its own addon hub component, by SPIFFE ID.
 - The hub maps each verified SPIFFE ID to the cluster or addon it belongs to. A component can act
@@ -150,12 +150,19 @@ flowchart LR
 | Klusterlet agents (registration, work, or the singleton agent) | `spiffe://<td>/ocm/managedcluster/<c>/klusterlet` |
 | Addon agent | `spiffe://<td>/ocm/managedcluster/<c>/addon/<a>` |
 | Klusterlet operator on a hosting cluster (Hosted modes) | `spiffe://<td>/ocm/hosting/<h>/klusterlet-operator` |
-| gRPC server | `spiffe://<hub-td>/ocm/hub/grpc-server` |
-| Hub webhooks | `spiffe://<hub-td>/ocm/hub/{registration,work,addon}-webhook` |
-| Addon hub component | `spiffe://<hub-td>/ocm/hub/addon/<a>` |
-| Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<hub-td>/ocm/hub/<component>` |
+| gRPC server | `spiffe://<td>/ocm/hub/grpc-server` |
+| Hub webhooks | `spiffe://<td>/ocm/hub/{registration,work,addon}-webhook` |
+| Addon hub component | `spiffe://<td>/ocm/hub/addon/<a>` |
+| Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<component>` |
 
 `<c>`, `<h>` and `<a>` must be DNS-1123 labels. The `/ocm/managedcluster` prefix is configurable.
+
+> **Note:** The examples use a single trust domain, `<td>`, for the hub and all managed clusters.
+> The hub and the managed clusters can also be in different trust domains, for example one per
+> environment or per cluster, as long as the trust domains are federated (see
+> [SPIRE requirements](#spire-requirements)). The hub lists every trust domain it accepts in
+> `trustDomains`, and each agent verifies the hub against the full SPIFFE ID in `serverID`,
+> including its trust domain.
 
 #### Mapping to OCM identities
 
@@ -249,7 +256,7 @@ access once, with a `ClusterRoleBinding`. The hosting administrator creates the 
 #### Story 5: An addon agent and its hub component
 
 The `my-addon` agent connects to its own hub component. The agent accepts only
-`spiffe://<hub-td>/ocm/hub/addon/my-addon`; the hub component accepts only
+`spiffe://<td>/ocm/hub/addon/my-addon`; the hub component accepts only
 `…/ocm/managedcluster/*/addon/my-addon` and learns the cluster name from the peer's SPIFFE ID.
 
 #### Story 6: Mixed on-prem and cloud fleet
@@ -342,7 +349,7 @@ use it in up to three ways:
    cannot act for each other.
 2. **Addon agent ↔ addon hub component.** A new `pkg/addon/spiffe` helper in addon-framework gives
    both sides a ready mTLS configuration:
-   - `AgentTLSConfig(addonName)` accepts only `spiffe://<hub-td>/ocm/hub/addon/<a>`;
+   - `AgentTLSConfig(addonName)` accepts only `spiffe://<td>/ocm/hub/addon/<a>`;
    - `HubTLSConfig(addonName)` accepts only `…/ocm/managedcluster/*/addon/<a>`, and
      `ClusterFromPeer(ctx)` returns the cluster name from the peer's SPIFFE ID.
 3. **Addon agent → hub kube-apiserver**, only for addons that watch hub resources directly. This
@@ -389,7 +396,7 @@ With `spiffe`, components reach the remote kube-apiserver with their own JWT-SVI
 
 **Hosted ClusterManager:**
 
-1. The hub administrator binds `spiffe:spiffe://<hub-td>/ocm/hub/cluster-manager` to a role on the
+1. The hub administrator binds `spiffe:spiffe://<td>/ocm/hub/cluster-manager` to a role on the
    hub.
 2. The cluster-manager operator deploys the hub controllers on the management cluster, each with
    its own SPIFFE ID, and installs hub RBAC for those IDs. `external-hub-kubeconfig` and the
