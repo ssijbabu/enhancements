@@ -100,21 +100,27 @@ The problems:
 
 ### Overview
 
-```text
- Managed cluster (or hosting cluster)               Hub (or management cluster)
-┌──────────────────────────────────────┐          ┌───────────────────────────────────────────────┐
-│ klusterlet agent                     │  mTLS    │ gRPC server, SPIFFE listener                  │
-│  X.509-SVID                          │◄────────►│  X.509-SVID                                   │
-│   …/ocm/managedcluster/c1/klusterlet │  both    │   …/ocm/hub/grpc-server                       │
-│  accepts peer only if                │  sides   │  accepts peer only if its ID maps to a        │
-│   ID == …/ocm/hub/grpc-server        │  verify  │   cluster or addon identity; pins the request │
-│                                      │  IDs     │   to that cluster; SAR authorization          │
-│ addon agent                          │          │                                               │
-│  X.509-SVID …/c1/addon/my-addon      │◄────────►│ addon hub component (optional, direct)        │
-│                                      │          │  X.509-SVID …/ocm/hub/addon/my-addon          │
-│                                      │          │                                               │
-│ SPIRE agent (Workload API)           │          │ SPIRE agent (Workload API)                    │
-└──────────────────────────────────────┘          └───────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph spoke["Managed cluster (or hosting cluster)"]
+        spireS["SPIRE agent<br/>(Workload API)"]
+        kl["klusterlet agent<br/>…/ocm/managedcluster/c1/klusterlet<br/><i>accepts peer only if ID is<br/>…/ocm/hub/grpc-server</i>"]
+        ad["addon agent<br/>…/ocm/managedcluster/c1/addon/my-addon"]
+    end
+
+    subgraph hub["Hub (or management cluster)"]
+        grpc["gRPC server, SPIFFE listener<br/>…/ocm/hub/grpc-server<br/><i>maps peer ID to a cluster or addon identity,<br/>pins the request to that cluster,<br/>SAR authorization</i>"]
+        adh["addon hub component (optional)<br/>…/ocm/hub/addon/my-addon"]
+        spireH["SPIRE agent<br/>(Workload API)"]
+    end
+
+    spireS -.->|X.509-SVID| kl
+    spireS -.->|X.509-SVID| ad
+    kl <==>|"mTLS: both sides<br/>verify SPIFFE IDs"| grpc
+    ad <==>|mTLS| grpc
+    ad <==>|"mTLS (direct)"| adh
+    grpc <-.-|X.509-SVID| spireH
+    adh <-.-|X.509-SVID| spireH
 ```
 
 1. **Identity.** Each OCM component gets an SVID from its local SPIRE agent. The SPIFFE ID encodes
