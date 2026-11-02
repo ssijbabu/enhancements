@@ -19,7 +19,7 @@ certificate, and the hub signs it with its own CA. With the `spiffe` driver, eve
 identities to **authenticate each other on every connection**:
 
 - The klusterlet agent proves it is `spiffe://<td>/ocm/managedcluster/<c>/klusterlet`, and accepts
-  the hub only if the hub proves it is `spiffe://<td>/ocm/hub/grpc-server`.
+  the hub only if the hub proves it is `spiffe://<td>/ocm/hub/<hub>/grpc-server`.
 - An addon agent proves it is `…/ocm/managedcluster/<c>/addon/<a>`, and accepts only the hub, or
   its own addon hub component, by SPIFFE ID.
 - The hub maps each verified SPIFFE ID to the cluster or addon it belongs to. A component can act
@@ -104,13 +104,13 @@ The problems:
 flowchart LR
     subgraph spoke["Managed cluster (or hosting cluster)"]
         spireS["SPIRE agent<br/>(Workload API)"]
-        kl["klusterlet agent<br/>…/ocm/managedcluster/c1/klusterlet<br/><i>accepts peer only if ID is<br/>…/ocm/hub/grpc-server</i>"]
+        kl["klusterlet agent<br/>…/ocm/managedcluster/c1/klusterlet<br/><i>accepts peer only if ID is<br/>…/ocm/hub/default/grpc-server</i>"]
         ad["addon agent<br/>…/ocm/managedcluster/c1/addon/my-addon"]
     end
 
     subgraph hub["Hub (or management cluster)"]
-        grpc["gRPC server, SPIFFE listener<br/>…/ocm/hub/grpc-server<br/><i>maps peer ID to a cluster or addon identity,<br/>pins the request to that cluster,<br/>SAR authorization</i>"]
-        adh["addon hub component (optional)<br/>…/ocm/hub/addon/my-addon"]
+        grpc["gRPC server, SPIFFE listener<br/>…/ocm/hub/default/grpc-server<br/><i>maps peer ID to a cluster or addon identity,<br/>pins the request to that cluster,<br/>SAR authorization</i>"]
+        adh["addon hub component (optional)<br/>…/ocm/hub/default/addon/my-addon"]
         spireH["SPIRE agent<br/>(Workload API)"]
     end
 
@@ -176,11 +176,15 @@ OCM component (see [Admission](#admission-cel-instead-of-webhooks)).
 | Klusterlet agents (registration, work, or the singleton agent) | `spiffe://<td>/ocm/managedcluster/<c>/klusterlet` |
 | Addon agent | `spiffe://<td>/ocm/managedcluster/<c>/addon/<a>` |
 | Klusterlet operator on a hosting cluster (Hosted modes) | `spiffe://<td>/ocm/hosting/<h>/klusterlet-operator` |
-| gRPC server | `spiffe://<td>/ocm/hub/grpc-server` |
-| Addon hub component | `spiffe://<td>/ocm/hub/addon/<a>` |
-| Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<component>` |
+| gRPC server | `spiffe://<td>/ocm/hub/<hub>/grpc-server` |
+| Addon hub component | `spiffe://<td>/ocm/hub/<hub>/addon/<a>` |
+| Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<hub>/<component>` |
 
-`<c>`, `<h>` and `<a>` must be DNS-1123 labels: at most 63 characters, only lowercase letters,
+`<hub>` is the hub's name, set in the `ClusterManager` and defaulting to `default`. It separates
+hubs that share a trust domain, for example a dev and a prod hub on one SPIRE deployment, so that
+an agent pointed at the wrong hub's address rejects it.
+
+`<c>`, `<h>`, `<a>` and `<hub>` must be DNS-1123 labels: at most 63 characters, only lowercase letters,
 digits and `-`, starting and ending with a letter or digit (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, as
 checked by `validation.IsDNS1123Label` in `k8s.io/apimachinery`). Each name appears as one segment
 of a SPIFFE ID path and as one field of a `:`-separated OCM username, which
@@ -246,88 +250,421 @@ OCM relies on three things from SPIRE:
 
 ### User Stories
 
+Stories 1–5 use one trust domain, `example.org`, and one hub named `default`. Story 6 shows several
+trust domains.
+
 #### Story 1: Hub administrator sets up the hub
 
-The SPIRE administrator has installed a SPIRE agent on the hub cluster and created an entry for the
-gRPC server. The hub administrator runs:
+**Before:** the SPIRE administrator has installed a SPIRE agent on the hub cluster and created an
+entry for the gRPC server:
+
+```bash
+spire-server entry create \
+  -spiffeID spiffe://example.org/ocm/hub/default/grpc-server \
+  -parentID spiffe://example.org/spire/agent/k8s_psat/hub \
+  -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:grpc-server-sa
+```
+
+**The hub administrator runs:**
 
 ```bash
 clusteradm init --registration-drivers spiffe
 ```
 
-The cluster-manager operator:
-- deploys the gRPC server with a SPIFFE listener, exposed outside the hub through a Service that
-  passes TLS through;
-- installs CEL admission policies instead of admission webhooks, so there is no webhook server, no
-  webhook certificate and no `caBundle`;
-- binds `open-cluster-management:spiffe-bootstrappers` to the bootstrap `ClusterRole`;
-- creates no CA, no serving-certificate Secrets and no bootstrap token.
+This creates a `ClusterManager` with the `spiffe` driver:
 
-If the gRPC server cannot get its SVID, for example because its SPIRE entry is missing, the operator
-sets `SPIFFEIdentityAvailable=False` on the `ClusterManager`.
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: ClusterManager
+metadata:
+  name: cluster-manager
+spec:
+  registrationConfiguration:
+    registrationDrivers:
+    - authType: spiffe
+      spiffe:
+        hubName: default        # default value, shown for clarity
+```
 
-`clusteradm init` prints what managed cluster administrators need to join. Neither value is
-secret:
-- the SPIFFE listener's external address;
-- the gRPC server's SPIFFE ID, for example `spiffe://example.org/ocm/hub/grpc-server`.
+```mermaid
+sequenceDiagram
+    actor Admin as Hub administrator
+    participant CLI as clusteradm
+    participant Op as cluster-manager operator
+    participant API as Hub kube-apiserver
+    participant GRPC as gRPC server
+    participant SA as SPIRE agent (hub)
 
-The trust domains the hub accepts are not OCM configuration. They are the trust domains whose
-bundles SPIRE gives the gRPC server: its own, plus those listed in `federatesWith` on its SPIRE
-entry.
+    Admin->>CLI: clusteradm init --registration-drivers spiffe
+    CLI->>API: create ClusterManager (authType spiffe)
+    Op->>API: deploy gRPC server and expose SPIFFE listener (LoadBalancer)
+    Op->>API: install CEL admission policies (no webhooks)
+    Op->>API: bind spiffe-bootstrappers group to bootstrap ClusterRole
+    GRPC->>SA: fetch X.509-SVID and trust bundles (Workload API)
+    SA-->>GRPC: spiffe://example.org/ocm/hub/default/grpc-server
+    GRPC->>GRPC: open SPIFFE listener on :8091
+    Op->>API: ClusterManager status: listener address, SPIFFEIdentityAvailable=True
+    CLI-->>Admin: print join command
+```
 
-**Approval.** By default every new cluster waits for a hub administrator to accept it
-([Story 3](#story-3-hub-administrator-accepts-the-cluster)). To accept some clusters
-automatically, the hub administrator adds SPIFFE ID patterns, where `*` matches one path segment:
+**Result:**
+
+```text
+Hub is ready. To join a managed cluster, run on that cluster:
+
+    clusteradm join --cluster-name <cluster-name> --registration-auth spiffe \
+      --hub-grpc-url grpc.hub.example.com:443
+```
+
+- There is no CA, no serving-certificate Secret, no bootstrap token and no webhook. Nothing in the
+  join command is secret.
+- If the gRPC server cannot get its SVID, for example because its SPIRE entry is missing, the
+  operator sets `SPIFFEIdentityAvailable=False` on the `ClusterManager`.
+- The trust domains the hub accepts are decided by SPIRE: the hub's own, plus those listed in
+  `federatesWith` on the gRPC server's entry (see [Story 6](#story-6-mixed-on-prem-and-cloud-fleet)).
+
+**Approval** is manual by default ([Story 3](#story-3-hub-administrator-accepts-the-cluster)). To
+accept some clusters automatically, the hub administrator adds SPIFFE ID patterns, where `*`
+matches one path segment:
 
 ```bash
 clusteradm init --registration-drivers spiffe \
   --spiffe-auto-approve 'spiffe://example.org/ocm/managedcluster/prod-eu-*/klusterlet'
 ```
 
-Clusters whose bound SPIFFE ID does not match a pattern still need manual acceptance.
-
 #### Story 2: Managed cluster administrator joins a cluster
 
-The SPIRE administrator has created the cluster's OCM entries. The managed cluster administrator
-runs:
+**Before:** the SPIRE administrator has installed a SPIRE agent on cluster `prod-eu-1` and created
+its klusterlet entries, parented to that cluster's node alias:
+
+```bash
+for sa in klusterlet-registration-sa klusterlet-work-sa; do
+  spire-server entry create \
+    -spiffeID spiffe://example.org/ocm/managedcluster/prod-eu-1/klusterlet \
+    -parentID spiffe://example.org/spire/agent/k8s_psat/prod-eu-1 \
+    -selector k8s:ns:open-cluster-management-agent -selector k8s:sa:$sa
+done
+```
+
+**The managed cluster administrator runs** the join command from Story 1:
 
 ```bash
 clusteradm join --cluster-name prod-eu-1 --registration-auth spiffe \
-  --hub-grpc-url grpc.hub.example.com:443 \
-  --hub-spiffe-id spiffe://example.org/ocm/hub/grpc-server
+  --hub-grpc-url grpc.hub.example.com:443
 ```
 
-There is nothing secret to pass, so there is no bootstrap Secret: the URL and the hub's SPIFFE ID
-go in the `Klusterlet` spec. The agent connects, accepts the server only if it presents the
-expected ID, and announces itself. The hub creates `ManagedCluster/prod-eu-1` bound to the agent's
-SPIFFE ID.
+This creates a `Klusterlet`. There is no bootstrap Secret:
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: Klusterlet
+metadata:
+  name: klusterlet
+spec:
+  clusterName: prod-eu-1
+  registrationConfiguration:
+    registrationDriver:
+      authType: spiffe
+      spiffe:
+        serverURL: grpc.hub.example.com:443
+        # serverID defaults to spiffe://example.org/ocm/hub/default/grpc-server
+```
+
+```mermaid
+sequenceDiagram
+    actor Admin as Cluster administrator
+    participant KOp as klusterlet operator
+    participant Agent as klusterlet agent
+    participant SA as SPIRE agent (prod-eu-1)
+    participant GRPC as gRPC server (hub)
+    participant API as Hub kube-apiserver
+
+    Admin->>KOp: clusteradm join (creates Klusterlet)
+    KOp->>Agent: deploy agents with Workload API access
+    Agent->>SA: fetch X.509-SVID and trust bundles
+    SA-->>Agent: spiffe://example.org/ocm/managedcluster/prod-eu-1/klusterlet
+    Agent->>Agent: own ID matches cluster name? Else SPIFFEIdentityAvailable=False
+    Agent->>GRPC: mTLS handshake
+    GRPC-->>Agent: presents …/ocm/hub/default/grpc-server
+    Agent->>Agent: accept only the expected hub ID
+    GRPC->>GRPC: map peer to system:open-cluster-management:prod-eu-1:klusterlet
+    Agent->>GRPC: create ManagedCluster prod-eu-1
+    GRPC->>GRPC: request pinned to prod-eu-1, allowed by bootstrap group
+    GRPC->>API: create ManagedCluster prod-eu-1 with spiffe-id annotation
+    Note over Agent,API: cluster is bound to its SPIFFE ID and waits for acceptance
+```
+
+**Why the agent checks the hub's SPIFFE ID.** Any workload with an SVID from a trusted trust domain
+could otherwise pose as the hub and send the agent `ManifestWork`. The agent defaults to
+`spiffe://<its own trust domain>/ocm/hub/default/grpc-server`. `--hub-spiffe-id` is needed only
+when the hub is in another trust domain (Story 6) or has a name other than `default`, for example:
+
+```bash
+clusteradm join --cluster-name prod-eu-1 --registration-auth spiffe \
+  --hub-grpc-url grpc.hub-prod.example.com:443 \
+  --hub-spiffe-id spiffe://example.org/ocm/hub/prod/grpc-server
+```
+
+The join command printed by `clusteradm init` already includes it when needed.
 
 #### Story 3: Hub administrator accepts the cluster
 
-A hub administrator checks the bound SPIFFE ID in `clusteradm get clusters` and runs
-`clusteradm accept --clusters prod-eu-1`, or auto-approval matches the SPIFFE ID. The cluster
-starts syncing. No certificate is requested or issued.
+**The hub administrator checks** which SPIFFE ID each waiting cluster is bound to:
+
+```text
+$ clusteradm get clusters
+NAME        ACCEPTED   SPIFFE ID                                                     AVAILABLE
+prod-eu-1   false      spiffe://example.org/ocm/managedcluster/prod-eu-1/klusterlet   Unknown
+```
+
+**and accepts it:**
+
+```bash
+clusteradm accept --clusters prod-eu-1
+```
+
+```mermaid
+sequenceDiagram
+    actor Admin as Hub administrator
+    participant API as Hub kube-apiserver
+    participant Reg as registration controller
+    participant GRPC as gRPC server
+    participant Agent as klusterlet agent (prod-eu-1)
+
+    Admin->>API: set hubAcceptsClient=true on ManagedCluster prod-eu-1
+    Note right of API: or SPIFFEHubDriver.Accept matches an auto-approve pattern
+    Reg->>API: bind group system:open-cluster-management:prod-eu-1 to cluster RBAC
+    Agent->>GRPC: lease, status, ManifestWork watch (same mTLS connection)
+    GRPC->>API: SubjectAccessReview as prod-eu-1 user and groups
+    API-->>GRPC: allowed
+    GRPC-->>Agent: ManifestWork for prod-eu-1
+```
+
+**Result:** the cluster is `Available`. No certificate was requested or issued.
+
+**If another identity claims the name.** Suppose a cluster in another trust domain also calls
+itself `prod-eu-1`. Its join is rejected, because `prod-eu-1` is bound to a different SPIFFE ID. If
+the cluster was really reinstalled with a new identity, an administrator moves the binding
+explicitly:
+
+```bash
+clusteradm rebind --cluster prod-eu-1 \
+  --spiffe-id spiffe://example.org/ocm/managedcluster/prod-eu-1/klusterlet
+```
 
 #### Story 4: Hosted klusterlet
 
-Cluster `edge-7` is managed in `Hosted` mode from hosting cluster `mgmt-1`. Its kube-apiserver
-trusts the SPIRE JWT issuer. The `edge-7` administrator grants the hosting operator's SPIFFE ID
-access once, with a `ClusterRoleBinding`. The hosting administrator creates the `Klusterlet` with
-`edge-7`'s apiserver URL. No kubeconfig is handed over.
+Cluster `edge-7` is managed in `Hosted` mode: its agents run on hosting cluster `mgmt-1`, and
+nothing OCM runs on `edge-7`.
+
+**Before:**
+
+1. The `edge-7` administrator configures its kube-apiserver to trust the SPIRE JWT issuer:
+
+   ```yaml
+   apiVersion: apiserver.config.k8s.io/v1beta1
+   kind: AuthenticationConfiguration
+   jwt:
+   - issuer:
+       url: https://oidc.spire.example.org
+       audiences: [edge-7]
+     claimMappings:
+       username:
+         claim: sub
+         prefix: "spiffe:"
+   ```
+
+2. The `edge-7` administrator grants the hosting operator its permissions once:
+
+   ```yaml
+   apiVersion: rbac.authorization.k8s.io/v1
+   kind: ClusterRoleBinding
+   metadata:
+     name: ocm-hosting-klusterlet-operator
+   roleRef:
+     apiGroup: rbac.authorization.k8s.io
+     kind: ClusterRole
+     name: open-cluster-management:hosted-klusterlet-operator   # provided by OCM: CRDs, namespace, agent RBAC
+   subjects:
+   - kind: User
+     name: spiffe:spiffe://example.org/ocm/hosting/mgmt-1/klusterlet-operator
+   ```
+
+3. The SPIRE administrator creates `edge-7`'s klusterlet entry parented to **`mgmt-1`**, where the
+   agents run:
+
+   ```bash
+   spire-server entry create \
+     -spiffeID spiffe://example.org/ocm/managedcluster/edge-7/klusterlet \
+     -parentID spiffe://example.org/spire/agent/k8s_psat/mgmt-1 \
+     -selector k8s:ns:klusterlet-edge-7 -selector k8s:sa:klusterlet-agent-sa
+   ```
+
+**The hosting administrator creates the `Klusterlet` on `mgmt-1`:**
+
+```yaml
+apiVersion: operator.open-cluster-management.io/v1
+kind: Klusterlet
+metadata:
+  name: klusterlet-edge-7
+spec:
+  clusterName: edge-7
+  deployOption:
+    mode: Hosted
+  managedClusterAPIServer:
+    url: https://edge-7.example.org:6443
+    audience: edge-7
+    serverTrust: CABundle
+    caBundle: <edge-7 kube-apiserver CA>
+  registrationConfiguration:
+    registrationDriver:
+      authType: spiffe
+      spiffe:
+        serverURL: grpc.hub.example.com:443
+```
+
+```mermaid
+flowchart LR
+    subgraph mgmt["Hosting cluster mgmt-1"]
+        spire["SPIRE agent"]
+        op["klusterlet operator<br/>…/ocm/hosting/mgmt-1/klusterlet-operator"]
+        agent["edge-7 klusterlet agent<br/>…/ocm/managedcluster/edge-7/klusterlet"]
+    end
+    subgraph edge["Managed cluster edge-7"]
+        api7["kube-apiserver<br/>trusts the SPIRE JWT issuer"]
+    end
+    subgraph hub["Hub"]
+        grpc["gRPC server<br/>…/ocm/hub/default/grpc-server"]
+    end
+    spire -.->|SVIDs| op
+    spire -.->|SVIDs| agent
+    op ==>|"JWT-SVID: install CRDs and agent RBAC"| api7
+    agent ==>|"JWT-SVID: apply ManifestWork"| api7
+    agent <==>|"mTLS: X.509-SVIDs"| grpc
+```
+
+**Result:** the agents reach `edge-7` with JWT-SVIDs and the hub with mutual TLS. No kubeconfig
+was handed over, and `external-managed-kubeconfig` is not used. The `edge-7` administrator can cut
+off the hosting cluster at any time by deleting the `ClusterRoleBinding`.
 
 #### Story 5: An addon agent and its hub component
 
-The `my-addon` agent connects to its own hub component. The agent accepts only
-`spiffe://<td>/ocm/hub/addon/my-addon`; the hub component accepts only
-`…/ocm/managedcluster/*/addon/my-addon` and learns the cluster name from the peer's SPIFFE ID.
+The `metrics` addon has an agent on each managed cluster that pushes data to a receiver on the
+hub. Today it would need its own CA and certificates. With SPIFFE, both sides use the addon
+identity helper.
+
+**Before:** the SPIRE administrator creates entries for both sides:
+
+```bash
+# Addon agent on prod-eu-1
+spire-server entry create \
+  -spiffeID spiffe://example.org/ocm/managedcluster/prod-eu-1/addon/metrics \
+  -parentID spiffe://example.org/spire/agent/k8s_psat/prod-eu-1 \
+  -selector k8s:ns:open-cluster-management-agent-addon -selector k8s:sa:metrics-agent-sa
+
+# Addon hub component
+spire-server entry create \
+  -spiffeID spiffe://example.org/ocm/hub/default/addon/metrics \
+  -parentID spiffe://example.org/spire/agent/k8s_psat/hub \
+  -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:metrics-receiver-sa
+```
+
+**The addon author writes:**
+
+```go
+// Agent side: trust only this addon's hub component.
+tlsConfig, err := spiffe.AgentTLSConfig(ctx, "metrics")
+conn, err := tls.Dial("tcp", "metrics.hub.example.com:443", tlsConfig)
+
+// Hub side: accept only this addon's agents, and learn which cluster is calling.
+tlsConfig, err := spiffe.HubTLSConfig(ctx, "metrics")
+// in the handler:
+cluster, err := spiffe.ClusterFromPeer(r.Context())   // "prod-eu-1"
+```
+
+```mermaid
+sequenceDiagram
+    participant SAs as SPIRE agent (prod-eu-1)
+    participant Agent as metrics agent (prod-eu-1)
+    participant Recv as metrics receiver (hub)
+    participant SAh as SPIRE agent (hub)
+
+    SAs-->>Agent: …/ocm/managedcluster/prod-eu-1/addon/metrics
+    SAh-->>Recv: …/ocm/hub/default/addon/metrics
+    Agent->>Recv: mTLS handshake
+    Recv-->>Agent: presents …/ocm/hub/default/addon/metrics
+    Agent->>Agent: accept only the metrics hub component
+    Recv->>Recv: accept only …/ocm/managedcluster/*/addon/metrics
+    Agent->>Recv: push metrics
+    Recv->>Recv: ClusterFromPeer gives prod-eu-1, store under that cluster
+```
+
+**Result:**
+- The receiver knows which cluster sent the data from the verified SPIFFE ID, not from anything in
+  the payload. One cluster cannot send data as another.
+- The klusterlet, other addons and other workloads cannot connect to the receiver, even with valid
+  SVIDs.
+- The addon reports its status and lease to the gRPC server with the same identity, so it also
+  cannot act as its cluster's klusterlet.
 
 #### Story 6: Mixed on-prem and cloud fleet
 
-On-prem clusters are in `onprem.example.org` and cloud clusters in `cloud.example.org`, each served
-by its own SPIRE deployment. The two federate. The hub is in `cloud.example.org`, and its gRPC
-server's SPIRE entry federates with `onprem.example.org`, so it accepts clusters from both. On-prem
-klusterlet entries federate with `cloud.example.org`, so they can verify the hub. Neither
-environment can mint the other's identities.
+On-prem clusters are in `onprem.example.org` and cloud clusters in `cloud.example.org`, each with
+its own SPIRE deployment. The hub is in `cloud.example.org`.
+
+**Before:**
+1. The two SPIRE servers federate, exchanging trust bundles through their bundle endpoints.
+2. The SPIRE administrators add `federatesWith` to the OCM entries:
+
+   ```bash
+   # Hub: accept clusters from onprem.example.org as well as its own trust domain
+   spire-server entry create \
+     -spiffeID spiffe://cloud.example.org/ocm/hub/default/grpc-server \
+     -parentID spiffe://cloud.example.org/spire/agent/k8s_psat/hub \
+     -federatesWith spiffe://onprem.example.org \
+     -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:grpc-server-sa
+
+   # On-prem cluster dc-1: able to verify the cloud hub
+   spire-server entry create \
+     -spiffeID spiffe://onprem.example.org/ocm/managedcluster/dc-1/klusterlet \
+     -parentID spiffe://onprem.example.org/spire/agent/k8s_psat/dc-1 \
+     -federatesWith spiffe://cloud.example.org \
+     -selector k8s:ns:open-cluster-management-agent -selector k8s:sa:klusterlet-work-sa
+   ```
+
+**The on-prem cluster joins** with the hub's full SPIFFE ID, because the hub is in a different trust
+domain:
+
+```bash
+clusteradm join --cluster-name dc-1 --registration-auth spiffe \
+  --hub-grpc-url grpc.hub.example.com:443 \
+  --hub-spiffe-id spiffe://cloud.example.org/ocm/hub/default/grpc-server
+```
+
+Cloud clusters join as in Story 2.
+
+```mermaid
+flowchart LR
+    subgraph onprem["Trust domain onprem.example.org"]
+        ss1["SPIRE server (on-prem)"]
+        dc1["dc-1 klusterlet<br/>spiffe://onprem.example.org/<br/>ocm/managedcluster/dc-1/klusterlet"]
+    end
+    subgraph cloud["Trust domain cloud.example.org"]
+        ss2["SPIRE server (cloud)"]
+        grpc["Hub gRPC server<br/>spiffe://cloud.example.org/<br/>ocm/hub/default/grpc-server"]
+        aks["aks-1 klusterlet<br/>spiffe://cloud.example.org/<br/>ocm/managedcluster/aks-1/klusterlet"]
+    end
+    ss1 <-.->|"federation: bundles"| ss2
+    dc1 <==>|"mTLS"| grpc
+    aks <==>|"mTLS"| grpc
+```
+
+**Result:**
+- One hub manages both environments, and both sides of every connection are verified.
+- The on-prem SPIRE server cannot issue `cloud.example.org` IDs, and the cloud server cannot issue
+  `onprem.example.org` IDs.
+- If a cluster in each trust domain uses the same name, the second one to join is rejected by the
+  identity binding (Story 3).
 
 ### Implementation Details/Notes/Constraints
 
@@ -359,6 +696,7 @@ A new `RegisterDriver` in `pkg/registration/register/spiffe`, selected by `authT
 
 - **Client.** sdk-go `GRPCConfig` gains a `spiffe` block (`socketPath`, `serverID`). The client
   dials with `tlsconfig.MTLSClientConfig(x509Source, bundleSource, tlsconfig.AuthorizeID(serverID))`.
+  When `serverID` is not set, the driver uses `spiffe://<trust domain of its own SVID>/ocm/hub/default/grpc-server`.
 - **Configuration** is rendered by the klusterlet operator from the `Klusterlet` spec. There is no
   bootstrap Secret; bootstrap and steady-state configuration are the same.
 - **`Process`** sends no CSR. It reports registration complete once the cluster is accepted.
@@ -424,7 +762,7 @@ use it in up to three ways:
    cannot act for each other.
 2. **Addon agent ↔ addon hub component.** A new `pkg/addon/spiffe` helper in addon-framework gives
    both sides a ready mTLS configuration:
-   - `AgentTLSConfig(addonName)` accepts only `spiffe://<td>/ocm/hub/addon/<a>`;
+   - `AgentTLSConfig(addonName)` accepts only `spiffe://<td>/ocm/hub/<hub>/addon/<a>`;
    - `HubTLSConfig(addonName)` accepts only `…/ocm/managedcluster/*/addon/<a>`, and
      `ClusterFromPeer(ctx)` returns the cluster name from the peer's SPIFFE ID.
 3. **Addon agent → hub kube-apiserver**, only for addons that watch hub resources directly. This
@@ -471,7 +809,7 @@ With `spiffe`, components reach the remote kube-apiserver with their own JWT-SVI
 
 **Hosted ClusterManager:**
 
-1. The hub administrator binds `spiffe:spiffe://<td>/ocm/hub/cluster-manager` to a role on the
+1. The hub administrator binds `spiffe:spiffe://<td>/ocm/hub/<hub>/cluster-manager` to a role on the
    hub.
 2. The cluster-manager operator deploys the hub controllers on the management cluster, each with
    its own SPIFFE ID, and installs hub RBAC for those IDs. `external-hub-kubeconfig` and the
@@ -490,6 +828,11 @@ hub in Hosted ClusterManager mode.
 
 ```go
 type SPIFFEHubConfig struct {
+    // Name of this hub, used in hub SPIFFE IDs: spiffe://<td>/ocm/hub/<hubName>/...
+    // Set it when several hubs share a trust domain.
+    // +kubebuilder:default="default"
+    HubName string `json:"hubName,omitempty"`
+
     // Exact SPIFFE IDs, or IDs with '*' path segments, matched against the bound SPIFFE ID.
     // +optional
     AutoApprovedIdentities []string `json:"autoApprovedIdentities,omitempty"`
@@ -508,8 +851,10 @@ For Hosted ClusterManager, `HostedClusterManagerConfiguration` gains
 type SPIFFEAgentConfig struct {
     // gRPC server SPIFFE listener address (host:port).
     ServerURL string `json:"serverURL"`
-    // SPIFFE ID the gRPC server must present.
-    ServerID string `json:"serverID"`
+    // SPIFFE ID the gRPC server must present. Defaults to
+    // spiffe://<the agent's trust domain>/ocm/hub/default/grpc-server.
+    // +optional
+    ServerID string `json:"serverID,omitempty"`
     // +kubebuilder:default="/ocm/managedcluster"
     PathPrefix string `json:"pathPrefix,omitempty"`
 }
@@ -550,7 +895,7 @@ Example entries, created by the SPIRE administrator:
 
 ```bash
 # Hub (cloud.example.org); the gRPC server accepts clusters from onprem.example.org too
-spire-server entry create -spiffeID spiffe://cloud.example.org/ocm/hub/grpc-server \
+spire-server entry create -spiffeID spiffe://cloud.example.org/ocm/hub/default/grpc-server \
   -parentID <hub-node-alias> -federatesWith spiffe://onprem.example.org \
   -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:grpc-server-sa
 
