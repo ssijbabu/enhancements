@@ -155,7 +155,15 @@ flowchart LR
 | Addon hub component | `spiffe://<td>/ocm/hub/addon/<a>` |
 | Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<component>` |
 
-`<c>`, `<h>` and `<a>` must be DNS-1123 labels. The `/ocm/managedcluster` prefix is configurable.
+`<c>`, `<h>` and `<a>` must be DNS-1123 labels: at most 63 characters, only lowercase letters,
+digits and `-`, starting and ending with a letter or digit (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, as
+checked by `validation.IsDNS1123Label` in `k8s.io/apimachinery`). Each name appears as one segment
+of a SPIFFE ID path and as one field of a `:`-separated OCM username, which
+`ValidateClusterIdentity` splits on `:`. Because a DNS-1123 label cannot contain `/` or `:`, a name
+always fills exactly one segment in both formats, so a crafted name cannot be read as a different
+cluster or addon. The hub rejects SPIFFE IDs whose name segments are not valid labels.
+
+The `/ocm/managedcluster` prefix is configurable.
 
 > **Note:** The examples use a single trust domain, `<td>`, for the hub and all managed clusters.
 > The hub and the managed clusters can also be in different trust domains, for example one per
