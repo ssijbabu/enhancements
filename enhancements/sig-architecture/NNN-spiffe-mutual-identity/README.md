@@ -149,14 +149,14 @@ Kubernetes' projected ServiceAccount tokens, which are out of scope.
 | | Local managed cluster kube-apiserver | Projected ServiceAccount token |
 | gRPC server | Hub kube-apiserver: hub resources on agents' behalf, SubjectAccessReview, `TokenRequest` | Projected ServiceAccount token |
 | Hub controllers (registration, work, placement, addon-manager) | Hub kube-apiserver | Projected ServiceAccount token; JWT-SVID in Hosted ClusterManager |
-| Hub webhooks | Called by the hub kube-apiserver | Webhook serves its X.509-SVID; the apiserver verifies it through `caBundle` (one-way) |
-| Cluster-manager operator | Hub kube-apiserver, including `caBundle` sync | Projected ServiceAccount token; JWT-SVID in Hosted ClusterManager |
+| Cluster-manager operator | Hub kube-apiserver, including installing the admission policies | Projected ServiceAccount token; JWT-SVID in Hosted ClusterManager |
 | Klusterlet operator | Local kube-apiserver; managed cluster kube-apiserver in Hosted modes | Projected ServiceAccount token; JWT-SVID in Hosted modes |
 
 OCM components never talk to the SPIRE server, the OIDC discovery provider or the JWT issuer. The
 remote kube-apiserver uses the issuer to verify JWT-SVIDs in Hosted modes, and federation runs
 between SPIRE servers. Between agents and the gRPC server there is only a layer-4 load balancer
-that passes TLS through.
+that passes TLS through. There are no admission webhooks, so the hub kube-apiserver never calls an
+OCM component (see [Admission](#admission-cel-instead-of-webhooks)).
 
 ### Registration: today vs. `spiffe`
 
@@ -177,10 +177,8 @@ that passes TLS through.
 | Addon agent | `spiffe://<td>/ocm/managedcluster/<c>/addon/<a>` |
 | Klusterlet operator on a hosting cluster (Hosted modes) | `spiffe://<td>/ocm/hosting/<h>/klusterlet-operator` |
 | gRPC server | `spiffe://<td>/ocm/hub/grpc-server` |
-| Hub webhooks | `spiffe://<td>/ocm/hub/{registration,work,addon}-webhook` |
 | Addon hub component | `spiffe://<td>/ocm/hub/addon/<a>` |
-| Cluster-manager operator | `spiffe://<td>/ocm/hub/cluster-manager` |
-| Hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<component>` |
+| Cluster-manager operator and hub controllers (Hosted ClusterManager only) | `spiffe://<td>/ocm/hub/<component>` |
 
 `<c>`, `<h>` and `<a>` must be DNS-1123 labels: at most 63 characters, only lowercase letters,
 digits and `-`, starting and ending with a letter or digit (`[a-z0-9]([-a-z0-9]*[a-z0-9])?`, as
@@ -250,8 +248,8 @@ OCM relies on three things from SPIRE:
 
 #### Story 1: Hub administrator sets up the hub
 
-The SPIRE administrator has installed a SPIRE agent on the hub cluster and created entries for the
-cluster-manager operator, the gRPC server and the webhooks. The hub administrator runs:
+The SPIRE administrator has installed a SPIRE agent on the hub cluster and created an entry for the
+gRPC server. The hub administrator runs:
 
 ```bash
 clusteradm init --registration-drivers spiffe
@@ -260,13 +258,13 @@ clusteradm init --registration-drivers spiffe
 The cluster-manager operator:
 - deploys the gRPC server with a SPIFFE listener, exposed outside the hub through a Service that
   passes TLS through;
-- deploys the webhooks with SVID-based TLS, and keeps their `caBundle` in sync with the SPIRE
-  bundle;
+- installs CEL admission policies instead of admission webhooks, so there is no webhook server, no
+  webhook certificate and no `caBundle`;
 - binds `open-cluster-management:spiffe-bootstrappers` to the bootstrap `ClusterRole`;
 - creates no CA, no serving-certificate Secrets and no bootstrap token.
 
-If a component cannot get its SVID, for example because its SPIRE entry is missing, the operator
-sets `SPIFFEIdentityAvailable=False` on the `ClusterManager`, naming the component.
+If the gRPC server cannot get its SVID, for example because its SPIRE entry is missing, the operator
+sets `SPIFFEIdentityAvailable=False` on the `ClusterManager`.
 
 `clusteradm init` prints what managed cluster administrators need to join. Neither value is
 secret:
@@ -378,7 +376,7 @@ When a SPIFFE-authenticated caller creates or updates a `ManagedCluster`, the gR
 - **rejects** the request if the cluster is already bound to a different SPIFFE ID (I4), for
   example the same cluster name appearing in a second trust domain.
 
-The registration webhook allows changes to the annotation only from the gRPC server and from
+A `ValidatingAdmissionPolicy` allows changes to the annotation only from the gRPC server and from
 administrators with a dedicated `rebind` permission. `clusteradm rebind` performs that change.
 
 #### Hub registration driver
@@ -394,17 +392,24 @@ The cluster-manager operator binds `open-cluster-management:spiffe-bootstrappers
 SPIFFE ID, a cluster that has not yet been accepted can only create or read its own
 `ManagedCluster`.
 
-#### Hub webhooks
+#### Admission: CEL instead of webhooks
 
-The registration, work and addon webhooks serve TLS with their SVIDs, loaded from
-`workloadapi.X509Source` through controller-runtime's `webhook.Options.TLSOpts`. Each webhook's
-SPIRE entry carries a DNS SAN for its Service, or for its external address in Hosted ClusterManager
-mode.
+A hub using the `spiffe` driver runs no admission or conversion webhooks. An admission webhook is
+a TLS server that the kube-apiserver calls, and the kube-apiserver can only verify it through a
+`caBundle` stored in the webhook configuration. That would be a certificate stored by OCM, and a
+connection where only one side is verified. CEL runs inside the kube-apiserver, so neither exists.
 
-The kube-apiserver verifies webhooks against the `caBundle` field on their configuration objects.
-The cluster-manager operator keeps that field in sync with the hub trust domain's X.509 bundle from
-its own Workload API, including SPIRE's pre-published next CA. This is the one link where only one
-side is verified, because the kube-apiserver is not a SPIFFE workload.
+The cluster-manager operator installs:
+- **`ValidatingAdmissionPolicy`** objects for validation, including permission checks, which use
+  CEL's `authorizer` in place of SubjectAccessReview calls from a webhook;
+- **`MutatingAdmissionPolicy`** objects for defaulting;
+- **CRD validation rules** (`x-kubernetes-validations`) for checks on a single object.
+
+CRD conversion has no CEL equivalent. The `spiffe` driver therefore requires the hub to serve a
+single version of each OCM API, so no conversion webhook is needed.
+
+This requires a hub kube-apiserver with `ValidatingAdmissionPolicy` (GA in Kubernetes 1.30) and
+`MutatingAdmissionPolicy` available.
 
 The certificate-rotation controller does not run, and `signer-secret`, `ca-bundle-configmap` and
 the serving-certificate Secrets are never created.
@@ -471,7 +476,9 @@ With `spiffe`, components reach the remote kube-apiserver with their own JWT-SVI
 2. The cluster-manager operator deploys the hub controllers on the management cluster, each with
    its own SPIFFE ID, and installs hub RBAC for those IDs. `external-hub-kubeconfig` and the
    `*-sa-kubeconfig` Secrets are not used.
-3. The gRPC server and webhooks run on the management cluster with SVIDs, as in `Default` mode.
+3. The gRPC server runs on the management cluster with its SVID, as in `Default` mode. The
+   admission policies are installed on the hub and run inside the hub kube-apiserver, so the hub
+   no longer needs to reach webhooks on the management cluster.
 
 A cluster whose kube-apiserver cannot trust an external JWT issuer can still use `spiffe` in
 `Default` or `Singleton` mode, but cannot be the managed cluster in Hosted Klusterlet mode or the
@@ -546,13 +553,6 @@ Example entries, created by the SPIRE administrator:
 spire-server entry create -spiffeID spiffe://cloud.example.org/ocm/hub/grpc-server \
   -parentID <hub-node-alias> -federatesWith spiffe://onprem.example.org \
   -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:grpc-server-sa
-spire-server entry create -spiffeID spiffe://cloud.example.org/ocm/hub/cluster-manager \
-  -parentID <hub-node-alias> \
-  -selector k8s:ns:open-cluster-management -selector k8s:sa:cluster-manager
-spire-server entry create -spiffeID spiffe://cloud.example.org/ocm/hub/registration-webhook \
-  -parentID <hub-node-alias> \
-  -selector k8s:ns:open-cluster-management-hub -selector k8s:sa:registration-webhook-sa \
-  -dns cluster-manager-registration-webhook.open-cluster-management-hub.svc
 
 # Managed cluster prod-eu-1 (onprem.example.org); federates with the hub's trust domain
 for sa in klusterlet-registration-sa klusterlet-work-sa; do
@@ -587,7 +587,7 @@ spire-server entry create \
 | SPIRE configuration lets one spoke obtain another cluster's IDs | Cross-cluster impersonation | Documented isolation requirement; identity binding (I4) catches a second trust domain claiming a bound name |
 | Authenticator lets an unmapped identity through | Bypasses `ValidateClusterIdentity` | Reject everything outside the mapping table; tests assert this |
 | SPIRE unavailable | No new connections once SVIDs expire | SPIRE's own availability; the existing lease grace period |
-| Webhook `caBundle` falls behind a CA rotation | Webhook calls fail | Sync on every bundle change, including the pre-published next CA |
+| Hub kube-apiserver lacks `MutatingAdmissionPolicy` | Defaulting cannot run without a webhook | Document the minimum hub Kubernetes version; the operator reports a condition and does not enable `spiffe` |
 | Hosting cluster compromised | It can act as every cluster it hosts | Same as today with stored kubeconfigs, but granted explicitly per entry |
 | Remote apiserver can't trust an external JWT issuer | Hosted modes unavailable for that cluster | `Default`/`Singleton` modes |
 
@@ -606,8 +606,8 @@ spire-server entry create \
 - **Unit (sdk-go):** the authenticator with valid, expired, wrong-trust-domain and unmapped-path
   SVIDs; closing streams at expiry; the client rejecting a server with a different SPIFFE ID.
 - **Unit (ocm):** the `spiffe` register and hub drivers; identity binding and rebinding; TokenRequest
-  restrictions; webhook `caBundle` sync; the exec credential plugin; the CEL rules; the
-  addon-framework helper.
+  restrictions; the admission policies, against the same cases the webhooks cover today; the exec
+  credential plugin; the CRD validation rules; the addon-framework helper.
 - **Integration (envtest):** the gRPC server with a fake Workload API. Cover join, binding,
   acceptance, sync, reconnect at SVID expiry, CA rotation, the addon token exchange, and
   impersonation attempts that must fail: another cluster's name, an addon acting as its klusterlet,
@@ -630,7 +630,7 @@ spire-server entry create \
 - integration tests.
 
 **Beta:**
-- webhooks on SVIDs;
+- CEL admission policies replacing all hub webhooks;
 - addon identities;
 - Hosted Klusterlet and Hosted ClusterManager;
 - `clusteradm` support;
@@ -648,7 +648,8 @@ spire-server entry create \
 one at a time:
 
 1. Add `spiffe` to the ClusterManager's `registrationDrivers`. The operator opens the SPIFFE
-   listener next to the existing one.
+   listener next to the existing one and installs the CEL admission policies alongside the
+   existing webhooks.
 2. Move each cluster: create its SPIRE entries, then set the Klusterlet to `authType: spiffe`. The
    hub binds the existing `ManagedCluster` to the agent's SPIFFE ID. The cluster group is the same,
    so the cluster stays accepted and no RBAC changes are needed.
@@ -656,7 +657,7 @@ one at a time:
 4. Remove the other drivers. The operator refuses while any accepted cluster or addon still uses
    them. Once they are removed, it closes the old listener, stops the CSR signer, deletes
    `signer-secret`, `ca-bundle-configmap`, the serving-certificate Secrets and the bootstrap token,
-   and switches the webhooks to SVIDs.
+   and removes the webhooks and their configurations.
 
 Hosted clusters move by adding `managedClusterAPIServer` (or `hubAPIServer`) together with
 `authType: spiffe`. The operator stops using the kubeconfig Secret and deletes the copies it made.
