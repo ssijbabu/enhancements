@@ -1,0 +1,13 @@
+title: spiffe-mutual-identity
+authors:
+  - "@ssijbabu"
+reviewers:
+  - TBD
+approvers:
+  - TBD
+creation-date: 2026-10-31
+last-updated: 2026-11-02
+status: provisional
+see-also:
+  - "/enhancements/sig-architecture/141-grpc-based-registration"
+  - "/enhancements/sig-architecture/167-token-based-addon-registration"
